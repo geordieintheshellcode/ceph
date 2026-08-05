@@ -98,20 +98,22 @@ specific key's value or existence must include that key in its write set
 **Recommended structural fix**: don't rely on developers re-deriving, per
 operation, which keys need to be touched. Instead:
 
-- Every transaction that mutates an object's version state acquires a
-  pessimistic lock on the **primary key** first, via a single shared helper
-  function that is the *only* way to obtain such a transaction (e.g.
-  `withObjectTxn(ctx, objectKey, fn)`). This makes it structurally
-  impossible to write code that mutates object state without holding the
-  lock — the invariant is enforced by the API surface, not by convention.
+- Every transaction that mutates any key related to an object — version
+  keys (`:V:`), child keys (`:C:`), or the object entry itself — first
+  acquires a **claim on the primary key** (`:O:`), via a single shared
+  helper function that is the *only* way to obtain such a transaction
+  (`withObjectTxn(ctx, objectKey, fn)`). The mechanism differs by backend
+  (see §6), but the invariant is the same: it is structurally impossible to
+  mutate object state without the claim — enforced by the API surface, not
+  by convention.
 - Any transaction that is about to mutate a *specific* version key
   (delete-target, promote-target) also pessimistically locks that specific
   key before writing it (required regardless — see §4).
 
 This trades some unnecessary serialization (e.g. two deletes of two
-different non-current versions now queue behind the same primary lock even
+different non-current versions now queue behind the same claim even
 though they didn't need to conflict) for removing an entire class of future
-bugs. Reasonable default unless profiling shows the lock wait is a real
+bugs. Reasonable default unless profiling shows contention cost is a real
 bottleneck for a given object.
 
 **Does the second worked example in §2 invalidate this?** No — but it does
@@ -121,23 +123,24 @@ correctly serialized, because it writes the specific `:V:` key it depends on.
 This satisfies the general invariant above — the key the transaction depends
 on *is* in its write set — just not through the primary key.
 
-What the example does not do is justify skipping the primary key lock for
+What the example does not do is justify skipping the primary key claim for
 *other* operations. The structural fix is deliberately conservative: "always
-lock the primary key" is a sufficient condition that is easy to enforce and
+claim the primary key" is a sufficient condition that is easy to enforce and
 impossible to accidentally violate when adding new operations. The delete of a
 non-current version is a case where the minimal necessary condition happens
 to be provably weaker. For any operation that is not this narrow (anything
 that reads `:V:` to *choose* which key to then act on, rather than acting on
-a specific key supplied by the caller) the primary key anchor is still
+a specific key supplied by the caller) the primary key claim is still
 required, because the scan result itself is not in the write set.
 
-Alternative if profiling does show contention cost: stay optimistic, but
-make every mutating operation *unconditionally* bump a monotonic generation
-counter co-located with the primary key, as part of its normal write set.
-This guarantees write-set intersection for any two concurrent mutations on
-the object without an extra blocking RPC — cheaper on the uncontended path,
-same "hard to get wrong" property as the lock-based approach since the rule
-("always bump the counter") is unconditional rather than semantic.
+**TiKV alternative** if profiling shows the lock's uncontended round-trip
+cost is significant: stay optimistic, but make every mutating operation
+*unconditionally* bump a monotonic generation counter co-located with the
+primary key. This guarantees write-set intersection for any two concurrent
+mutations without a blocking RPC — cheaper on the uncontended path, same
+"hard to get wrong" property as the lock-based approach since the rule
+("always bump the counter") is unconditional. On FDB this counter is not
+needed — see §6.
 
 ## 4. Pessimistic locking in TiKV — what it actually does
 
@@ -190,9 +193,7 @@ without needing the "co-write a shared key" trick TiKV requires.
   concurrent transaction has a *read*-conflict range covering that key.
 - **Snapshot reads** (`snapshot=true` in the C API) perform a `Get` or
   `GetRange` without registering a read-conflict range. Useful for reads
-  on data known to be immutable — e.g. walking deleted `:V:` entries in
-  the prev-pointer scheme (§6) where re-creation is structurally
-  impossible.
+  on data that is structurally immutable once written.
 
 Comparison with TiKV pessimistic locking:
 
@@ -216,145 +217,81 @@ Also relevant: FDB's ~5-second transaction limit exists because Resolvers
 only retain enough recent commit history to check conflict ranges within
 that window.
 
-## 6. Eliminating range scans with a prev pointer
+## 6. Backend mechanisms for the claim on `:O:`
 
-The range scan in Case 2 (delete current, find next to promote) is the source
-of all the complexity in §2 and §3. It can be eliminated entirely by storing
-`prev_version_id` in every `:O:` and `:V:` entry — a direct pointer to the
-version immediately below in the chain.
+The backends achieve the `:O:` claim differently. `withObjectTxn` encapsulates
+the difference so that operation authors never interact with it directly.
 
-```
-:O:     = { version_id=FFFC, ref=..., prev=FFFD }
-:V:FFFD = { version_id=FFFD, ref=..., prev=FFFE }
-:V:FFFE = { version_id=FFFE, ref=..., prev=FFFF }
-:V:FFFF = { version_id=FFFF, ref=..., prev=nil  }
-```
+### FDB
 
-Case 2 becomes two point reads — `:O:` (already required) and
-`:Get(:V:prev_version_id)` — with both in the write set. No range scan,
-no implicit write-set coupling, no gap/predicate locking required.
+Every mutating operation reads `:O:` before making any routing decision —
+to verify existence, obtain the `ref_tag`, or read the current version. On FDB
+that non-snapshot read is the claim: it automatically registers a read-conflict
+range on `:O:`. Because `PutObject` always writes `:O:`, any concurrent
+`PutObject` is caught by the Resolver at commit regardless of which child or
+version key the operation then writes. For operations that also scan `:V:` or
+`:C:*`, FDB's `getRange` additionally registers a read-conflict range over the
+scanned subspace, providing phantom protection for free.
 
-### Stale pointers and the sequential walk
-
-Case 1 (delete non-current) deletes its target `:V:` entry without updating
-the prev pointer in `:O:`. If the deleted entry is the one `:O:`.prev
-references, the pointer is stale.
-
-Case 2 handles this by walking sequentially: if `Get(:V:prev_id)` returns
-not-found, try `Get(:V:(prev_id + 1))`, and so on. This is safe because:
-
-- Version IDs are strictly sequential integers with no gaps (concurrent PUTs
-  serialize through `:O:`), so a not-found entry in the live ID range is
-  definitively deleted — not absent because it was never created.
-- Deleted entries are **write-once** — once removed they can never be
-  re-created. Reading them without write-set protection is safe; their state
-  is permanently fixed.
-- The entry actually promoted is always in the write set. Write-write conflict
-  (TiKV) or read-conflict range (FDB) protects it.
-
-On FDB, intermediate `Get` calls on deleted entries register read-conflict
-ranges that can never fire spuriously (the entries are immutable). As an
-optimisation, snapshot reads (no conflict range registered) could be used for
-those hops since immutability is guaranteed by design.
-
-### Tradeoffs vs. range scan
-
-The range scan approach handles gaps at the storage layer: TiKV's coprocessor
-and FDB's range read both skip deleted entries internally and return the first
-live key in one round trip regardless of how many gaps precede it. The
-sequential walk pays one network round trip per gap.
-
-| | Range scan | Prev pointer + walk |
-|---|---|---|
-| Case 2, no gaps | 1 range read + 1 point read | 2 point reads |
-| Case 2, k gaps | 1 range read + 1 point read | k + 1 point reads |
-| Case 1 | unchanged | unchanged |
-| PUT | unchanged | unchanged (prev is the old `:O:` version_id, already known) |
-| List versions | `:V:` range scan still required | `:V:` range scan still required |
-| Storage | baseline | +4 bytes per entry |
-
-Gaps form only when Case 1 concurrently deletes the specific version that
-`:O:`.prev references. Lifecycle policies typically target old versions rather
-than the most-recently-demoted one, so the common case is zero gaps and both
-approaches cost the same. Under a workload that bulk-deletes recent non-current
-versions concurrently with active Case 2 operations, the range scan has better
-and more predictable performance.
-
-On FDB, `get()` futures can be pipelined, recovering some per-hop latency if
-reads are issued speculatively ahead of awaiting results. This does not fully
-match a single range read and wastes bandwidth on the speculative requests that
-turn out not to be needed.
-
-The prev pointer design makes the TiKV conflict argument structural and obvious
-at the cost of Case 2 read amplification proportional to concurrent gap-creating
-Case 1 operations. The range scan has consistent O(1) Case 2 performance at the
-cost of the implicit write-set coupling described in §2 and §3.
-
-## 7. DB-agnostic range scan protection
-
-If the range scan is kept (rather than replaced by the prev pointer scheme in
-§6), the conflict protection must be made explicit and structural rather than
-relying on incidental write-set intersection. The two backends require
-genuinely different mechanisms.
-
-### Why the epoch key write can be elided on FDB
-
-In the generation-counter pattern discussed in §3, each mutating transaction
-both reads and writes a per-object coordination key (`:E:objectname`):
+No extra coordination key is needed on FDB. `withObjectTxn` just ensures its
+`:O:` read is non-snapshot:
 
 ```
-gen = txn.Get(":E:objectname")   // registers read-conflict range on FDB
-txn.Put(":E:objectname", gen+1)  // in write set on TiKV; write-conflict on FDB
+// FDB
+func withObjectTxn(txn, objectKey, fn):
+    obj = txn.Get(objectKey)   // non-snapshot — registers read-conflict on :O:
+    return fn(txn, obj)
 ```
 
-The read is load-bearing on FDB. Without it, no read-conflict range is
-registered on `:E:`, and FDB's Resolver — which checks read-conflict vs.
-write-conflict only — would never fire on that key regardless of what other
-transactions write there.
+### TiKV
 
-However, the Put is not what protects the `:V:` range scan on FDB. The
-`getRange` call itself automatically registers a read-conflict range covering
-the entire scanned subspace. Any concurrent transaction that writes into that
-range carries a write-conflict on the key it modified; the Resolver detects the
-overlap and aborts the scanner. The epoch key's write-conflict range plays no
-part in this.
+On TiKV a read registers nothing. Two options:
 
-Consequently, on FDB you could elide not just the Put but the epoch key
-entirely — the `getRange` read-conflict is sufficient. On TiKV the epoch key
-(both read and write) remains required, because TiKV's write-write conflict
-check is the only available mechanism and range scans are unprotected.
-
-### The correct DB-agnostic abstraction
-
-Because the backends have fundamentally different conflict models, the
-abstraction should reflect that rather than using a single coordination key
-that is load-bearing on one backend and dead weight on the other:
+**Pessimistic lock** — `LockKeys(:O:)` before any read or write. The claim is
+proactive: concurrent writers on the same object block until the lock is
+released, so the losing transaction never does wasted work.
 
 ```
-// FDB: getRange already registers a read-conflict range — nothing extra needed.
-func protectVersionChainScan(txn, objectName):
-    pass  // no-op
-
-// TiKV: read+write epoch key unconditionally to force write-set intersection.
-func protectVersionChainScan(txn, objectName):
-    gen = txn.Get(epochKey(objectName))
-    txn.Put(epochKey(objectName), gen + 1)
+// TiKV — pessimistic lock
+func withObjectTxn(txn, objectKey, fn):
+    txn.LockKeys(objectKey)
+    obj = txn.Get(objectKey)
+    return fn(txn, obj)
 ```
 
-`withObjectTxn` calls `protectVersionChainScan` unconditionally before
-invoking the caller's logic. On FDB the overhead is zero. On TiKV it is one
-read-write round trip on the epoch key, which is the minimum cost of making
-the range scan safe.
+**Epoch counter** — unconditionally read and increment a coordination key
+co-located with `:O:`. Optimistic: no blocking RPC, no deadlock risk, but
+conflict is detected only at commit and the losing transaction's work is
+discarded.
 
-The key property of this abstraction: it is structurally impossible to perform
-a version-chain mutation through `withObjectTxn` without the correct protection
-being applied for the backend in use. The invariant is enforced by the API
-surface, not by each operation author remembering which keys to touch.
+```
+// TiKV — epoch counter
+func withObjectTxn(txn, objectKey, fn):
+    gen = txn.Get(epochKey(objectKey))
+    obj = txn.Get(objectKey)
+    txn.Put(epochKey(objectKey), gen + 1)
+    return fn(txn, obj)
+```
 
-## 8. Declarative operation API
+Both guarantee that any two concurrent mutations on the same object
+conflict — whichever `withObjectTxn` variant is chosen, one will be forced to
+retry with a fresh view of `:O:`. The choice between them is a TiKV-specific
+performance tradeoff (see §3).
 
-All the analysis in §2, §3, §6, and §7 — write-set coupling, epoch keys,
-prev pointer walks, retry-changes-case behaviour — arises because RGW
+### Why the epoch counter write is not needed on FDB
+
+If the epoch counter pattern were applied on FDB, the write would be redundant.
+FDB's Resolver checks read-conflict vs. write-conflict, not write-write: two
+transactions that both write a key without reading it do not conflict. Writing
+`:E:` on FDB causes a conflict only when a concurrent transaction has a
+read-conflict range covering it — but the non-snapshot `Get(:O:)` already
+covers `:O:` directly, making the epoch key dead weight. On TiKV the epoch
+write is the only available mechanism for forcing write-set intersection.
+
+## 7. Declarative operation API
+
+All the analysis in §2, §3, and §6 — write-set coupling, epoch keys,
+retry-changes-case behaviour — arises because RGW
 constructs transactions at the KV primitive level and must therefore understand
 each backend's isolation model. The alternative is to move that boundary up:
 RGW expresses *what* it wants to happen, and each backend implementation is
@@ -373,8 +310,8 @@ ListVersions(ctx, key, ...) → []version
 
 All of the versioning operations discussed in this document are single-object,
 single-transaction operations and map cleanly onto this interface. Behind it,
-the TiKV backend owns the epoch key, the `withObjectTxn` helper, and the choice
-between range scan and prev pointer. The FDB backend uses read-conflict ranges
+the TiKV backend owns the epoch key and the `withObjectTxn` helper. The FDB
+backend uses read-conflict ranges
 internally. RGW sees none of it. The correctness argument — the entire subject
 of this document — moves into the backend, which is the only place that knows
 its own isolation model.
@@ -438,7 +375,7 @@ implementation, not through the full RGW stack. The two concerns — S3 operatio
 semantics and KV transaction safety — are tested independently against their
 respective interfaces.
 
-## 9. Child-key operations and the limits of write-set intersection
+## 8. Child-key operations and the limits of write-set intersection
 
 The write-set intersection technique in §2 works because of a directional
 property: every operation that could invalidate a concurrent read necessarily
@@ -520,7 +457,7 @@ viable as a replacement for the pessimistic lock on child-key operations, where
 the bump has no semantic grounding and the class of operations that must carry
 it can only be identified structurally.
 
-The declarative API in §8 absorbs this automatically: `withObjectTxn` lives
+The declarative API in §7 absorbs this automatically: `withObjectTxn` lives
 inside the backend, and both version-chain mutations and child-key operations
 go through it. The distinction between the two cases is an implementation detail
 of the backend, invisible to RGW.
