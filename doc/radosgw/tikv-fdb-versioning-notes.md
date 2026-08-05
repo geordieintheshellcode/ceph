@@ -162,26 +162,7 @@ same "hard to get wrong" property as the lock-based approach since the rule
 - No deadlock risk is avoided for free — pessimistic locks can deadlock;
   TiKV runs deadlock detection to resolve this.
 
-## 5. TiDB / SQL layer
-
-TiDB compiles rows directly to TiKV keys (`t{tableID}_r{handle}` for a row,
-keyed off the primary key/handle; `t{tableID}_i{indexID}{value}` for index
-entries). `SELECT ... FOR UPDATE` on a specific row is literally the same
-`LockKeys` RPC as the Go client example, just issued by the SQL layer.
-
-- DML statements (`UPDATE`/`DELETE`/`INSERT`) automatically take the
-  pessimistic lock on affected rows as part of executing the statement —
-  the SQL engine does what the Go example does manually with `LockKeys`
-  before `Set`/`Delete`.
-- TiDB does **not** support gap locking (confirmed against current docs) —
-  same phantom-read limitation as raw TiKV, for the same underlying reason
-  (no gap-lock primitive at the KV layer). TiDB's own docs state its SI
-  isolation level cannot avoid write-skew anomalies.
-- Gotcha: when a DML statement contains an embedded `SELECT`, TiDB does
-  **not** lock the rows read by that subquery — different from MySQL/InnoDB
-  behavior, easy to trip over when porting logic.
-
-## 6. FoundationDB comparison
+## 5. FoundationDB comparison
 
 FDB's default `get`/`getRange` behavior registers a **read-conflict range**
 for every read automatically — so a range scan *is* protected by default,
@@ -210,7 +191,7 @@ without needing the "co-write a shared key" trick TiKV requires.
 - **Snapshot reads** (`snapshot=true` in the C API) perform a `Get` or
   `GetRange` without registering a read-conflict range. Useful for reads
   on data known to be immutable — e.g. walking deleted `:V:` entries in
-  the prev-pointer scheme (§8) where re-creation is structurally
+  the prev-pointer scheme (§6) where re-creation is structurally
   impossible.
 
 Comparison with TiKV pessimistic locking:
@@ -235,27 +216,7 @@ Also relevant: FDB's ~5-second transaction limit exists because Resolvers
 only retain enough recent commit history to check conflict ranges within
 that window.
 
-## 7. S3 multipart uploads and versioning
-
-A completed multipart upload produces exactly one object version, same as
-a regular PUT:
-
-- The version ID is assigned at `CompleteMultipartUpload`, not per part.
-- `UploadPart` calls don't create versions — they stage data under an
-  upload ID that isn't yet an object.
-- An aborted or abandoned multipart upload creates no version at all.
-- Concurrent multipart uploads to the same key are independent; whichever
-  completes last wins as current (same last-writer-wins semantics as two
-  concurrent regular PUTs).
-
-Design implication: parts should live in a separate staging keyspace keyed
-by upload ID until `CompleteMultipartUpload`, at which point the assembled
-object is written as a version key + primary key update inside a single
-transaction, going through the same locking path as a normal put. This
-keeps the object-level lock held only for the atomic "publish" step, not
-for the whole upload duration.
-
-## 8. Eliminating range scans with a prev pointer
+## 6. Eliminating range scans with a prev pointer
 
 The range scan in Case 2 (delete current, find next to promote) is the source
 of all the complexity in §2 and §3. It can be eliminated entirely by storing
@@ -329,10 +290,10 @@ at the cost of Case 2 read amplification proportional to concurrent gap-creating
 Case 1 operations. The range scan has consistent O(1) Case 2 performance at the
 cost of the implicit write-set coupling described in §2 and §3.
 
-## 9. DB-agnostic range scan protection
+## 7. DB-agnostic range scan protection
 
 If the range scan is kept (rather than replaced by the prev pointer scheme in
-§8), the conflict protection must be made explicit and structural rather than
+§6), the conflict protection must be made explicit and structural rather than
 relying on incidental write-set intersection. The two backends require
 genuinely different mechanisms.
 
@@ -390,9 +351,9 @@ a version-chain mutation through `withObjectTxn` without the correct protection
 being applied for the backend in use. The invariant is enforced by the API
 surface, not by each operation author remembering which keys to touch.
 
-## 10. Declarative operation API
+## 8. Declarative operation API
 
-All the analysis in §2, §3, §8, and §9 — write-set coupling, epoch keys,
+All the analysis in §2, §3, §6, and §7 — write-set coupling, epoch keys,
 prev pointer walks, retry-changes-case behaviour — arises because RGW
 constructs transactions at the KV primitive level and must therefore understand
 each backend's isolation model. The alternative is to move that boundary up:
@@ -403,7 +364,7 @@ fully responsible for *how* to do it safely.
 
 ```
 Put(ctx, key, value) → versionId
-DeleteMarker(ctx, key) → versionId
+DeleteCurrent(ctx, key) → versionId
 DeleteVersion(ctx, key, versionId) → error
 GetCurrent(ctx, key) → (value, versionId)
 GetVersion(ctx, key, versionId) → value
@@ -477,20 +438,90 @@ implementation, not through the full RGW stack. The two concerns — S3 operatio
 semantics and KV transaction safety — are tested independently against their
 respective interfaces.
 
-## 11. TiKV storage layout (RocksDB)
+## 9. Child-key operations and the limits of write-set intersection
 
-- TiKV runs **two RocksDB instances** per node: one for KV data (`kvdb`),
-  one for Raft logs (`raftdb`). Locks live in the KV instance, not the Raft
-  one.
-- Within `kvdb`, data is split into column families (CFs) — logical
-  partitions within the **same** RocksDB instance, not separate databases:
-  - **Default CF**: actual values
-  - **Write CF**: MVCC version/commit metadata
-  - **Lock CF**: pessimistic locks and prewrite locks
-- CFs share the same WAL (so a lock write and a later commit write can be
-  part of the same atomic, Raft-replicated write batch) but have separate
-  memtables and SST files, so high-churn Lock CF traffic doesn't intermix
-  with long-lived Default CF value data.
-- Every read checks Lock CF first (fails if a lock is present), then looks
-  up the latest valid commit in Write CF, then fetches the value from
-  Default CF.
+The write-set intersection technique in §2 works because of a directional
+property: every operation that could invalidate a concurrent read necessarily
+writes the same anchor key (`:O:`). The intersection is not arranged; it is
+forced by what the operation must do. You cannot change "current" without
+writing the primary pointer.
+
+Child-key operations like `PutObjectTagging` expose a case where this
+structural property does not exist — and cannot be made to exist without
+abandoning the write-set approach entirely.
+
+### The scenario
+
+When tags spill to an external child entry (`:C:<ref_tag>T`), a subsequent
+`PutObjectTagging` call (where the object is already external — the common
+case after the first call) reads `:O:` to verify the object exists and to
+obtain the `ref_tag`, then writes only `:C:<ref_tag>T`. It has no legitimate
+write to perform on `:O:` — the object's identity, content, and metadata are
+unchanged.
+
+Concurrent `PutObject` replaces the object: new `:O:` with `ref_tag=B`, old
+`:O:` moved to GC.
+
+Write sets:
+- `PutObjectTagging`: `{ :C:A:T }`
+- `PutObject`: `{ :O:, G:... }`
+
+No intersection. On TiKV, `PutObjectTagging` commits successfully, writing
+tags to a `ref_tag` that is now in GC. The GC entry was written before
+`:C:A:T` existed, so the GC worker has no record of it to clean up. The tags
+are silently orphaned; the new `:O:` (with `ref_tag=B`) shows no external
+tags.
+
+On FDB, `PutObjectTagging`'s `Get(:O:)` registers a read-conflict range on
+`:O:`. `PutObject`'s write to `:O:` carries a write-conflict. The Resolver
+fires, `PutObjectTagging` aborts and retries, reads the new `:O:` with
+`ref_tag=B`, writes `:C:B:T`. Correct.
+
+### Why write-set intersection cannot be the solution
+
+The technique in §2 requires the *invalidating* operation — the one that makes
+your read stale — to write some key that you also write. For the version chain,
+the invalidating operation is `PutObject`, which writes `:O:`; and every
+version-mutating operation also writes `:O:`, so the invariant holds.
+
+For `PutObjectTagging`, the invalidating operation is `PutObject`, which writes
+`:O:`. `PutObjectTagging` writes `:C:<ref_tag>T`. There is no key that both
+have a semantic reason to write. Any intersection would have to be artificial —
+forcing `PutObjectTagging` to also write `:O:` for no reason other than
+satisfying the conflict-detection mechanism.
+
+The epoch-counter approach from §3 would do exactly this: make `PutObjectTagging`
+unconditionally bump a counter co-located with `:O:`. This creates intersection
+mechanically and would protect the race. But it converts the guarantee from
+structural to conventional. The rule "every child-key write must also bump the
+epoch counter" cannot be derived from what the operation does — it is purely a
+coordination protocol. A future operation that writes a child key and forgets to
+bump the counter silently breaks isolation with no indication that anything is
+wrong.
+
+The version-chain invariant ("does this operation change 'current'? then it
+writes `:O:`") is semantically verifiable — you can look at an operation and
+determine whether it applies. The child-key invariant ("does this operation read
+`:O:` to route a child-key write? then it must also bump `:E:`") is not
+verifiable from semantics; it can only be enforced by structure.
+
+### Implication
+
+For child-key operations, the pessimistic lock via `withObjectTxn` is the only
+robust solution on TiKV. The read of `:O:` must be covered by a lock acquired
+before any decision about which child key to write; write-set intersection after
+the fact cannot substitute for it, because no natural write-set overlap exists.
+
+This also tightens the scope of the epoch-counter alternative described in §3.
+The epoch counter is viable for version-chain mutations — operations on that
+family naturally cluster around `:O:`, and the "always bump the counter" rule
+maps cleanly onto "always write `:O:` for semantic reasons anyway". It is not
+viable as a replacement for the pessimistic lock on child-key operations, where
+the bump has no semantic grounding and the class of operations that must carry
+it can only be identified structurally.
+
+The declarative API in §8 absorbs this automatically: `withObjectTxn` lives
+inside the backend, and both version-chain mutations and child-key operations
+go through it. The distinction between the two cases is an implementation detail
+of the backend, invisible to RGW.
+
