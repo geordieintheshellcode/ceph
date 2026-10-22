@@ -9,7 +9,8 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(FDB_ROOT "${CMAKE_SOURCE_DIR}/../third_party/fdb")
+set(FDB_ROOT "${CMAKE_SOURCE_DIR}/../third_party/fdb" CACHE PATH
+    "FoundationDB client installation prefix containing usr/include and usr/lib64")
 set(FDB_INCLUDE_DIR "${FDB_ROOT}/usr/include")
 set(FDB_LIB_DIR "${FDB_ROOT}/usr/lib64")
 

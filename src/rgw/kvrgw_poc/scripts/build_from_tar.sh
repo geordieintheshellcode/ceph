@@ -11,13 +11,13 @@
 #
 #!/bin/bash
 set -euo pipefail
-# Activate gcc-toolset-12 (required for C++23 <format> support)
-GCC_TOOLSET_ENABLE="/opt/rh/gcc-toolset-12/enable"
+# Activate a GCC toolset with C++23 support.
+GCC_TOOLSET_ENABLE="${GCC_TOOLSET_ENABLE:-/opt/rh/gcc-toolset-12/enable}"
 if [[ -f "$GCC_TOOLSET_ENABLE" ]]; then
     source "$GCC_TOOLSET_ENABLE"
 else
-    echo "ERROR: gcc-toolset-12 not found at $GCC_TOOLSET_ENABLE"
-    echo "Install it with:  sudo dnf install gcc-toolset-12"
+    echo "ERROR: GCC toolset not found at $GCC_TOOLSET_ENABLE"
+    echo "Install gcc-toolset-12 or set GCC_TOOLSET_ENABLE to another toolset's enable script"
     exit 1
 fi
 
@@ -38,8 +38,9 @@ done
 # Build C++ backend
 echo ""
 echo "=== Building C++ backend ==="
-cmake -B "$ROOT/build" -S "$ROOT/backend"
-cmake --build "$ROOT/build" -j"$(nproc)"
+cmake -B "$ROOT/build" -S "$ROOT/backend" \
+    -DFDB_ROOT="${FDB_ROOT:-$ROOT/third_party/fdb}"
+cmake --build "$ROOT/build" -j"${BUILD_JOBS:-$(nproc)}"
 echo "Backend: $ROOT/build/kv-rgw-backend"
 
 # Build Go frontend

@@ -14,7 +14,7 @@ S3-compatible object storage over FoundationDB with bucket versioning.
 
 - FoundationDB (server + client libraries)
 - CMake, GCC/Clang with C++23
-- Go 1.22+
+- Go 1.25+
 - protoc (protobuf compiler)
 - nginx
 
@@ -24,7 +24,71 @@ S3-compatible object storage over FoundationDB with bucket versioning.
 bash scripts/build_from_tar.sh
 ```
 
-This installs Go protoc plugins if missing, builds the C++ backend and Go frontend.
+This builds the C++ backend and Go frontend.
+
+### Interactive container build
+
+From the Ceph repository root:
+
+```bash
+make -C src/rgw/kvrgw_poc shell
+```
+
+Or run `make shell` from the POC directory. This builds the image (reusing
+Docker's cache) before opening the shell. Use `make docker-image` to build only
+the image. Set `IMAGE=...` to override the image name.
+
+The equivalent Docker commands are:
+
+```bash
+docker build -t kvrgw-build - < src/rgw/kvrgw_poc/Dockerfile.build
+docker run --rm -it \
+  --user "$(id -u):$(id -g)" \
+  --mount "type=bind,source=$(pwd),target=/workspace" \
+  kvrgw-build
+```
+
+The container opens a Bash shell in `/workspace/src/rgw/kvrgw_poc`. Run:
+
+```bash
+./scripts/build_from_tar.sh
+```
+
+The script is named `build_from_tar.sh`, not `build_for_tar.sh`. Sources and
+`build/` outputs stay in your checkout, owned by your host user. On SELinux
+hosts, replace `--mount ...` with `-v "$(pwd):/workspace:Z"`.
+
+The image is x86-64 only and includes GCC Toolset 14, Go 1.25 (with Go's
+automatic toolchain selection), CMake, JSON/YAML/OpenSSL development packages,
+and the FoundationDB 7.3.69 client. It does not copy source code, compile during
+image creation, or start FoundationDB or the gateway. No full Ceph build or
+submodule initialization is required.
+
+The image defaults to three build jobs; override with
+`BUILD_JOBS=2 ./scripts/build_from_tar.sh` if memory is limited.
+Use a fresh POC `build/` directory if it already contains CMake output from a
+different host path or toolchain. The compiled binaries depend on the
+container's libraries and paths; this is not a portable runtime image.
+
+### FoundationDB runtime prerequisites
+
+To download the client and server binaries into this checkout:
+
+```bash
+./scripts/fetch_fdb.sh
+```
+
+This downloads FoundationDB 7.3.69 x86-64 RPMs, verifies their published SHA-256
+checksums, and extracts them into `third_party/fdb` without root privileges.
+It requires `curl`, `sha256sum`, `rpm2cpio`, and `cpio`, all included in the
+build image. Set `FDB_VERSION` to select another 7.3.x release.
+
+**The build container does not support `reload.sh` as-is.** That script uses
+the lab's Docker Compose cluster, host-specific absolute bind mounts, six
+mounted drives (`/mnt/fdb0` through `/mnt/fdb2` and `/mnt/fdb-log0` through
+`/mnt/fdb-log2`), `sudo`, nginx, and S3 test tools. Fetching binaries does not
+provide those services or mounts. In particular, `reload.sh --clean` wipes
+the configured FDB data; do not use it against a cluster you need to keep.
 
 ## Run
 
