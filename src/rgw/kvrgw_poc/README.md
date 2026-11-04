@@ -61,8 +61,13 @@ hosts, replace `--mount ...` with `-v "$(pwd):/workspace:Z"`.
 The image is x86-64 only and includes GCC Toolset 14, Go 1.25 (with Go's
 automatic toolchain selection), CMake, JSON/YAML/OpenSSL development packages,
 and the FoundationDB 7.3.69 client. It does not copy source code, compile during
-image creation, or start FoundationDB or the gateway. No full Ceph build or
-submodule initialization is required.
+image creation, or start FoundationDB or the gateway. No full Ceph build is
+required, but the backend uses the header-only `src/xxHash` submodule, so
+initialize it on the host first:
+
+```bash
+git submodule update --init --recursive --force src/xxHash
+```
 
 The image defaults to three build jobs; override with
 `BUILD_JOBS=2 ./scripts/build_from_tar.sh` if memory is limited.
