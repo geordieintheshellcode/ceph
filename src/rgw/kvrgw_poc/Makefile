@@ -35,8 +35,12 @@ package: build
 deploy:
 	@test -f "$(DIST)/kvrgw-gw.tar.gz" || { echo "no bundle in $(DIST); run 'make package' first" >&2; exit 1; }
 	ssh "$(DEPLOY_HOST)" mkdir -p "$(DEPLOY_DIR)"
-	rsync -av --progress "$(DIST)/kvrgw-gw.tar.gz" \
-		"$(POC_DIR)/scripts/run_gateway.sh" "$(POC_DIR)/scripts/s5cmd_smoke_test.sh" \
-		"$(POC_DIR)/scripts/blast_put.sh" "$(POC_DIR)/scripts/perf_multi.sh" "$(POC_DIR)/scripts/.env" \
+	rsync -av --progress \
+		"$(DIST)/kvrgw-gw.tar.gz" \
+		"$(POC_DIR)/scripts/run_gateway.sh" \
+		"$(POC_DIR)/scripts/s5cmd_smoke_test.sh" \
+		"$(POC_DIR)/scripts/blast_put.sh" \
+		"$(POC_DIR)/scripts/perf_multi.sh" \
+		"$(POC_DIR)/scripts/.env" \
 		"$(DEPLOY_HOST):$(DEPLOY_DIR)/"
 	@echo "On $(DEPLOY_HOST): cd $(DEPLOY_DIR) && ./run_gateway.sh start && ./s5cmd_smoke_test.sh"

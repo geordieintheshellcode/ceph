@@ -49,18 +49,23 @@ void encode_numeric_counter(uint64_t val, std::span<char, sizeof(uint64_t)> out_
 // ---------------------------------------------------------------------------
 // Standalone Numeric Counter Allocator
 // ---------------------------------------------------------------------------
+// Many gateways may allocate from the same counter key at once (e.g. startup),
+// so allow far more retries than the general kMaxTxnRetries.
+static constexpr int kCounterMaxRetries = 100;
+static constexpr int kCounterRetrySleepMsec = 5;
+
 KvrgwErrorCode LKeyNumericCounter::allocate( KvStore& store,
 					     std::string_view counter_name,
 					     uint64_t& out_id)
 {
   const auto key = make_l_key(kLocalTypeNumeric, counter_name);
 
-  for (int attempt = 0; attempt < kMaxTxnRetries; ++attempt) {
+  for (int attempt = 0; attempt < kCounterMaxRetries; ++attempt) {
     auto tr_res = store.begin_transaction();
     if (!tr_res) {
       auto ec = fdb_to_error(tr_res.error());
       if (is_retriable(ec)) {
-	sleep_for_msec(10 * (attempt + 1));
+	sleep_for_msec(kCounterRetrySleepMsec);
         continue;
       }
       return ec;
@@ -71,7 +76,7 @@ KvrgwErrorCode LKeyNumericCounter::allocate( KvStore& store,
     if (!val_res) {
       auto ec = fdb_to_error(val_res.error());
       if (is_retriable(ec)) {
-	sleep_for_msec(10 * (attempt + 1));
+	sleep_for_msec(kCounterRetrySleepMsec);
         continue;
       }
       return ec;
@@ -99,7 +104,7 @@ KvrgwErrorCode LKeyNumericCounter::allocate( KvStore& store,
     if (!is_retriable(ec)) {
       return ec;
     }
-    sleep_for_msec(10 * (attempt + 1));
+    sleep_for_msec(kCounterRetrySleepMsec);
   }
 
   return KVRGW_ERR_MAX_RETRIES_EXCEEDED;

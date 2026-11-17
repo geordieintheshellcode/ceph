@@ -76,6 +76,7 @@ perf_container() {
   done
   "$DOCKER" run --rm "${tty_args[@]}" --init ${DOCKER_RUN_ARGS:-} --network host \
     ${PERF_CONTAINER_NAME:+--name "$PERF_CONTAINER_NAME"} \
+    ${PERF_CPUSET:+--cpuset-cpus "$PERF_CPUSET"} \
     -v "$CLUSTER_FILE:/etc/foundationdb/fdb.cluster:ro" \
     "${env_args[@]}" \
     --entrypoint /opt/kvrgw/kv-rgw-backend "$IMAGE" --perf /tmp/kvrgw-perf.sock /tmp/perf-data

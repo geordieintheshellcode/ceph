@@ -10,8 +10,11 @@
 #   - its own KVRGW_INSTANCE_ID <i>        => distinct object names
 # Output per instance goes to $LOGDIR/instance-<i>.log; a summary is printed at the end.
 #
-# Environment: PERF_TENANT_PREFIX (default perf), STAGGER (seconds between launches, default 2), RUN_ID, LOGDIR, ENV_FILE, plus any
+# Environment: PERF_TENANT_PREFIX (default perf), STAGGER (seconds between launches, default 0), RUN_ID, LOGDIR, ENV_FILE, plus any
 # run_gateway.sh override (CLUSTER_FILE, DOCKER, ...) or PERF_* value (overrides .env).
+#   PIN=1            pin each instance to its own share of the cores (docker --cpuset-cpus,
+#                    the container equivalent of taskset); N > cores shares cores round-robin
+#   CPU_LIST=0-15    cores to spread over (default: all online cores, e.g. "0-7,16-23")
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -21,7 +24,7 @@ N="${1:-3}"
 
 RUN="${RUN_ID:-$(date +%Y%m%d%H%M%S)}"
 PREFIX="${PERF_TENANT_PREFIX:-perf}"
-STAGGER="${STAGGER:-2}"
+STAGGER="${STAGGER:-0}"
 LOGDIR="${LOGDIR:-$PWD/perf-logs/$RUN}"
 DOCKER="${DOCKER:-docker}"
 mkdir -p "$LOGDIR"
@@ -32,6 +35,31 @@ export SKIP_LOAD=1
 
 pids=()
 names=()
+
+# Expand "0-3,8" into one CPU per array element.
+cpus=()
+if [[ "${PIN:-0}" == 1 ]]; then
+  IFS=',' read -ra parts <<< "${CPU_LIST:-$(cat /sys/devices/system/cpu/online)}"
+  for p in "${parts[@]}"; do
+    if [[ "$p" == *-* ]]; then
+      for ((c = ${p%-*}; c <= ${p#*-}; c++)); do cpus+=("$c"); done
+    else
+      cpus+=("$p")
+    fi
+  done
+fi
+
+# CPUs for instance $1: an even contiguous slice, or one shared core when N > cores.
+cpuset_for() {
+  local i=$1 M=${#cpus[@]} lo hi out=()
+  if ((N <= M)); then
+    lo=$((i * M / N)); hi=$(((i + 1) * M / N))
+  else
+    lo=$((i % M)); hi=$((lo + 1))
+  fi
+  for ((c = lo; c < hi; c++)); do out+=("${cpus[c]}"); done
+  (IFS=,; echo "${out[*]}")
+}
 cleanup() {
   trap - INT TERM
   echo "interrupted; stopping instances" >&2
@@ -46,12 +74,14 @@ for ((i = 0; i < N; i++)); do
   name="kvrgw-perf-$RUN-$i"
   tenant="$PREFIX-$RUN-$i"
   names+=("$name")
-  KVRGW_INSTANCE_ID="$i" KVRGW_TENANT_NAME="$tenant" PERF_CONTAINER_NAME="$name" \
+  cpuset=""
+  ((${#cpus[@]})) && cpuset="$(cpuset_for "$i")"
+  KVRGW_INSTANCE_ID="$i" KVRGW_TENANT_NAME="$tenant" PERF_CONTAINER_NAME="$name" PERF_CPUSET="$cpuset" \
     "$GW" perf-run > "$LOGDIR/instance-$i.log" 2>&1 &
   pids+=($!)
-  echo "  instance $i: tenant $tenant"
-  # Startup allocates ids from shared FDB counters with only 3 retries; staggering avoids conflicts.
-  if ((i < N - 1)); then sleep "$STAGGER"; fi
+  echo "  instance $i: tenant $tenant${cpuset:+, cpus $cpuset}"
+  # Optional spacing between launches (default 0: all start together).
+  if ((i < N - 1 && STAGGER > 0)); then sleep "$STAGGER"; fi
 done
 
 rcs=()
