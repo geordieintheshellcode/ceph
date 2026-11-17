@@ -1,0 +1,25 @@
+# Self-contained gateway runtime image: kv-rgw-frontend + libkvrgw.so + libfdb_c.so.
+# Build it with scripts/package_image.sh, which stages the built artifacts into
+# the build context. It does NOT contain an FDB server; point it at an existing
+# cluster via the mounted cluster file.
+FROM rockylinux:9
+
+RUN dnf install -y epel-release \
+    && dnf install -y yaml-cpp openssl-libs \
+    && dnf clean all
+
+COPY kv-rgw-frontend libkvrgw.so libfdb_c.so /opt/kvrgw/
+COPY kvrgw.yaml /etc/kvrgw/kvrgw.yaml
+COPY iam/ /etc/kvrgw/iam/
+
+ENV LD_LIBRARY_PATH=/opt/kvrgw \
+    FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster \
+    KVRGW_CONFIG_FILE=/etc/kvrgw/kvrgw.yaml \
+    KVRGW_IAM_DIR=/etc/kvrgw/iam \
+    KVRGW_DATA=/data \
+    KVRGW_ADMIN_SOCKET=/tmp/kvrgw-admin.sock
+
+VOLUME /data
+EXPOSE 9080
+ENTRYPOINT ["/opt/kvrgw/kv-rgw-frontend"]
+CMD ["-addr", ":9080"]

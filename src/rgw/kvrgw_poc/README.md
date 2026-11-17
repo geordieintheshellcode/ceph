@@ -58,6 +58,17 @@ The script is named `build_from_tar.sh`, not `build_for_tar.sh`. Sources and
 `build/` outputs stay in your checkout, owned by your host user. On SELinux
 hosts, replace `--mount ...` with `-v "$(pwd):/workspace:Z"`.
 
+### Packaging a runtime image for another machine
+
+After building, `scripts/package_image.sh` bundles the gateway into a runtime
+image (`Dockerfile.run`, Rocky 9, no FDB server) and writes `dist/kvrgw-gw.tar.gz`
+plus `dist/run_gateway.sh`. Copy those two files to a machine that has Docker
+and an existing FDB cluster, then run `./run_gateway.sh start`. It mounts the
+host's `/etc/foundationdb/fdb.cluster` read-only and keeps object data in
+`/var/lib/kvrgw` (node-local, so use one gateway unless that is shared). Port,
+credentials and tuning knobs are environment overrides; see the script header.
+The build in `build/` must be the Rocky one, matching `Dockerfile.run`.
+
 The image is x86-64 only and includes GCC Toolset 14, Go 1.25 (with Go's
 automatic toolchain selection), CMake, JSON/YAML/OpenSSL development packages,
 and the FoundationDB 7.3.69 client. It does not copy source code, compile during
