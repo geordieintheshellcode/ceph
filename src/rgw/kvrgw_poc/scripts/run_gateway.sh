@@ -50,7 +50,7 @@ PASS_VARS=(ROOT_ACCESS_KEY ROOT_SECRET_KEY KVRGW_TENANT_NAME KVRGW_GOMAXPROCS KV
            KVRGW_BATCH_SIZE KVRGW_BATCH_TIMEOUT_US KVRGW_BATCH_THREADS KVRGW_BATCH_MAX_INFLIGHT
            KVRGW_INSTANCE_ID KVRGW_PREFIX_LEN KVRGW_SUFFIX_LEN KVRGW_KEY_PREFIX KVRGW_KEY_SUFFIX
            KVRGW_RANDOM_PREFIX_PER_KEY KVRGW_TAG_COUNT KVRGW_TAG_NAME_BASE KVRGW_TAG_DATA_SIZE
-           KVRGW_METADATA_COUNT KVRGW_METADATA_DATA_SIZE)
+           KVRGW_METADATA_COUNT KVRGW_METADATA_DATA_SIZE KVRGW_METRICS_FILE KVRGW_METRICS_INTERVAL_MS)
 
 # Always (re)load the tarball when present so a redeploy replaces a stale image
 # of the same name; unchanged layers are reused, so this is cheap.
@@ -78,6 +78,7 @@ perf_container() {
     ${PERF_CONTAINER_NAME:+--name "$PERF_CONTAINER_NAME"} \
     ${PERF_CPUSET:+--cpuset-cpus "$PERF_CPUSET"} \
     -v "$CLUSTER_FILE:/etc/foundationdb/fdb.cluster:ro" \
+    ${PERF_METRICS_DIR:+-v "$PERF_METRICS_DIR:/metrics"} \
     "${env_args[@]}" \
     --entrypoint /opt/kvrgw/kv-rgw-backend "$IMAGE" --perf /tmp/kvrgw-perf.sock /tmp/perf-data
 }

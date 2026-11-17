@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -139,11 +140,151 @@ std::string_view make_object_name(int thread_id, uint64_t seq)
 
 } // namespace
 
+struct BenchResult;
+
+namespace {
+
+// Periodically appends cumulative counters to KVRGW_METRICS_FILE, from its own
+// thread. Line: ts_ms,instance,op,ops,errors,retries,total_us. Counters restart
+// from 0 whenever a command resets LatencyStats. Errors/retries come from the
+// BenchResult of the running command and are reported on its busiest op row.
+class MetricsEmitter {
+ public:
+  void start(LatencyStats &stats, int instance_id)
+  {
+    const char *path = std::getenv("KVRGW_METRICS_FILE");
+    if (!path || !*path) {
+      return;
+    }
+    int interval_ms = 1000;
+    if (const char *iv = std::getenv("KVRGW_METRICS_INTERVAL_MS")) {
+      interval_ms = std::atoi(iv);
+    }
+    if (interval_ms <= 0) {
+      return;
+    }
+    file_ = std::fopen(path, "a");
+    if (!file_) {
+      std::cerr << "metrics: cannot open " << path << "\n";
+      return;
+    }
+    if (std::ftell(file_) == 0) {
+      std::fputs("ts_ms,instance,op,ops,errors,retries,total_us\n", file_);
+      std::fflush(file_);
+    }
+    stats_ = &stats;
+    instance_ = instance_id;
+    thread_ = std::thread([this, interval_ms] {
+      std::unique_lock<std::mutex> lk(cv_mu_);
+      while (!stop_) {
+        cv_.wait_for(lk, std::chrono::milliseconds(interval_ms),
+                     [this] { return stop_; });
+        sample();
+      }
+    });
+  }
+
+  void stop()
+  {
+    if (!thread_.joinable()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(cv_mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    thread_.join();
+    std::fclose(file_);
+    file_ = nullptr;
+  }
+
+  void set_result(const std::atomic<int64_t> *errors,
+                  const std::atomic<int64_t> *retries)
+  {
+    errors_.store(errors, std::memory_order_release);
+    retries_.store(retries, std::memory_order_release);
+  }
+
+  // Take an immediate sample (end of a command, before counters are reset).
+  void sample_now()
+  {
+    if (file_) {
+      std::lock_guard<std::mutex> lk(cv_mu_);
+      sample();
+    }
+  }
+
+  bool active() const { return file_ != nullptr; }
+
+  ~MetricsEmitter() { stop(); }
+
+ private:
+  void sample()
+  {
+    const auto now = std::chrono::system_clock::now();
+    const long long ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now.time_since_epoch()).count();
+    int primary = -1;
+    int64_t best = 0;
+    for (int i = 0; i < static_cast<int>(OpType::kCount); ++i) {
+      const int64_t c = stats_->ops[i].count.load(std::memory_order_relaxed);
+      if (c > best) {
+        best = c;
+        primary = i;
+      }
+    }
+    const auto *e = errors_.load(std::memory_order_acquire);
+    const auto *r = retries_.load(std::memory_order_acquire);
+    for (int i = 0; i < static_cast<int>(OpType::kCount); ++i) {
+      const auto &s = stats_->ops[i];
+      const int64_t c = s.count.load(std::memory_order_relaxed);
+      if (c == 0) {
+        continue;
+      }
+      const long long errs =
+          (i == primary && e) ? e->load(std::memory_order_relaxed) : 0;
+      const long long rets =
+          (i == primary && r) ? r->load(std::memory_order_relaxed) : 0;
+      std::fprintf(file_, "%lld,%d,%s,%lld,%lld,%lld,%lld\n", ts_ms, instance_,
+                   op_type_name(static_cast<OpType>(i)),
+                   static_cast<long long>(c), errs, rets,
+                   static_cast<long long>(
+                       s.total_us.load(std::memory_order_relaxed)));
+    }
+    std::fflush(file_);
+  }
+
+  LatencyStats *stats_{};
+  int instance_{};
+  FILE *file_{};
+  std::thread thread_;
+  std::mutex cv_mu_;
+  std::condition_variable cv_;
+  bool stop_{false};
+  std::atomic<const std::atomic<int64_t> *> errors_{nullptr};
+  std::atomic<const std::atomic<int64_t> *> retries_{nullptr};
+};
+
+MetricsEmitter g_metrics;
+
+} // namespace
+
 struct BenchResult {
   std::atomic<int64_t> ops{};
   std::atomic<int64_t> errors{};
   std::atomic<int64_t> retries{};
   std::atomic<int64_t> err_counts[KvrgwErrorCode_ARRAYSIZE]{};
+
+  // One BenchResult lives per command run; it feeds the live metrics stream.
+  BenchResult() { g_metrics.set_result(&errors, &retries); }
+  ~BenchResult()
+  {
+    g_metrics.sample_now();
+    g_metrics.set_result(nullptr, nullptr);
+  }
+  BenchResult(const BenchResult &) = delete;
+  BenchResult &operator=(const BenchResult &) = delete;
 
   void record_error(KvrgwErrorCode code)
   {
@@ -515,9 +656,11 @@ void put_worker(KvRgwServiceImpl &service, tenant_id_t tenant_id,
       result.record_error(res.error_code);
       if (kvrgw::is_retriable(res.error_code)) {
         ++wr.retries;
+        result.retries.fetch_add(1, std::memory_order_relaxed);
       }
       else {
         ++wr.errors;
+        result.errors.fetch_add(1, std::memory_order_relaxed);
         std::cerr << "PUT_ERR t=" << thread_id << " key=" << name
                   << " code=" << res.error_code
                   << " msg=" << kvrgw_strerror(res.error_code) << "\n";
@@ -784,10 +927,6 @@ static void cmd_put(KvRgwServiceImpl &service, tenant_id_t tenant_id,
     for (int t = 0; t < p.concurrency; ++t) {
       total_ops += worker_results[t].ops;
       result.ops.fetch_add(worker_results[t].ops, std::memory_order_relaxed);
-      result.retries.fetch_add(worker_results[t].retries,
-                               std::memory_order_relaxed);
-      result.errors.fetch_add(worker_results[t].errors,
-                              std::memory_order_relaxed);
     }
 
     auto t1 = std::chrono::steady_clock::now();
@@ -2239,6 +2378,8 @@ int run_perf_driver(KvRgwServiceImpl &service, KvStore &store,
 
   g_metadata_file = std::getenv("KVRGW_METADATA_FILE");
 
+  g_metrics.start(service.latency_stats(), g_instance_id);
+
   std::cout << "=== KV-RGW Perf Driver (interactive) ===\n";
   std::cout << "tenant=" << config.tenant_name
             << " instance_id=" << g_instance_id
@@ -2296,6 +2437,7 @@ int run_perf_driver(KvRgwServiceImpl &service, KvStore &store,
 
     if (cmd == "quit" || cmd == "exit") {
       std::cout << "bye\n";
+      g_metrics.stop();
       return 0;
     }
 
@@ -2440,6 +2582,7 @@ int run_perf_driver(KvRgwServiceImpl &service, KvStore &store,
     std::cout << "perf> " << std::flush;
   }
 
+  g_metrics.stop();
   return 0;
 }
 

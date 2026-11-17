@@ -379,6 +379,19 @@ When errors or retries are non-zero, a per-error-code breakdown is printed:
 
 Error classification: `BenchResult` uses `err_counts[KvrgwErrorCode_ARRAYSIZE]` with `record_error(KvrgwErrorCode)`. Each error is counted by its specific proto enum name. Retriable errors (200–206) increment both `retries` and their specific counter; non-retriable errors increment `errors`.
 
+## Live Metrics Stream and `perf_multi.sh` Live View
+
+The driver can append cumulative counters to a CSV file from a dedicated thread (independent of the workers; relaxed atomic reads, one buffered write per sample). It works for every command that resets `LatencyStats`, not only `put`. The `progress:` output is unchanged.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `KVRGW_METRICS_FILE` | (unset = off) | File to append to (header written when empty) |
+| `KVRGW_METRICS_INTERVAL_MS` | 1000 | Sampling period; 0 disables |
+
+Columns: `ts_ms,instance,op,ops,errors,retries,total_us` (epoch ms; one row per op type with a non-zero count). `ops`/`total_us` come from `LatencyStats` and count completed requests including failed attempts; `errors`/`retries` come from the running command's result and are reported on its busiest op row. All counters restart from 0 when the next command begins, so consumers must treat a decrease as a reset.
+
+`scripts/perf_multi.sh N` bind-mounts its log directory into each container and writes `perf-logs/<run>/metrics-<i>.csv`. With `LIVE=1` (default) it prints one line every `LIVE_INTERVAL` seconds (default 2): elapsed, total ops/s, instances reporting, per-instance min/max, errors. Rates are deltas of cumulative ops over deltas of the sample timestamps; the series is saved in `live.csv` and peak/average totals appear in the final summary. `KVRGW_METRICS_INTERVAL_MS=0` or `LIVE=0` turns the live view off.
+
 ## Admin Socket: Live Stats (hz-style)
 
 The admin socket supports live polling during a running `put` command. The admin server thread runs independently of the perf driver stdin, so stats can be queried while a test is in progress.
