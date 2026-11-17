@@ -1,4 +1,5 @@
-# Self-contained gateway runtime image: kv-rgw-frontend + libkvrgw.so + libfdb_c.so.
+# Self-contained gateway runtime image: kv-rgw-frontend + libkvrgw.so + libfdb_c.so,
+# plus kv-rgw-backend (the interactive --perf driver, see run_gateway.sh perf).
 # Build it with scripts/package_image.sh, which stages the built artifacts into
 # the build context. It does NOT contain an FDB server; point it at an existing
 # cluster via the mounted cluster file.
@@ -8,7 +9,7 @@ RUN dnf install -y epel-release \
     && dnf install -y yaml-cpp openssl-libs \
     && dnf clean all
 
-COPY kv-rgw-frontend libkvrgw.so libfdb_c.so /opt/kvrgw/
+COPY kv-rgw-frontend kv-rgw-backend libkvrgw.so libfdb_c.so /opt/kvrgw/
 COPY kvrgw.yaml /etc/kvrgw/kvrgw.yaml
 COPY iam/ /etc/kvrgw/iam/
 

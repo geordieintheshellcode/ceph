@@ -15,13 +15,13 @@ IMAGE="${IMAGE:-kvrgw-gw}"
 DOCKER="${DOCKER:-docker}"
 FDB_LIB="${FDB_LIB:-$POC/third_party/fdb/usr/lib64/libfdb_c.so}"
 
-for f in "$POC/build/kv-rgw-frontend" "$POC/build/libkvrgw.so" "$FDB_LIB"; do
+for f in "$POC/build/kv-rgw-frontend" "$POC/build/kv-rgw-backend" "$POC/build/libkvrgw.so" "$FDB_LIB"; do
   [[ -f "$f" ]] || { echo "missing $f (run build_from_tar.sh / fetch_fdb.sh first)" >&2; exit 1; }
 done
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
-cp "$POC/build/kv-rgw-frontend" "$POC/build/libkvrgw.so" "$STAGE/"
+cp "$POC/build/kv-rgw-frontend" "$POC/build/kv-rgw-backend" "$POC/build/libkvrgw.so" "$STAGE/"
 cp "$FDB_LIB" "$STAGE/libfdb_c.so"
 cp "$POC/backend/kvrgw.yaml" "$STAGE/"
 cp -r "$POC/iam" "$STAGE/iam"

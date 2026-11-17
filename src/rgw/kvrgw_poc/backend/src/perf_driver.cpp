@@ -2111,6 +2111,9 @@ static void cmd_list_test(KvRgwServiceImpl &service, tenant_id_t tenant_id,
 int run_perf_driver(KvRgwRuntime &runtime)
 {
   PerfConfig pcfg;
+  if (const char *tn = std::getenv("KVRGW_TENANT_NAME"); tn && tn[0] != '\0') {
+    pcfg.tenant_name = tn;
+  }
   pcfg.perf_data_store = runtime.perf_data_store();
   return run_perf_driver(runtime.service(), runtime.store(), pcfg);
 }
