@@ -4,6 +4,17 @@
 
 The perf driver is an interactive CLI built into the backend binary. The `put` command calls `put_object_route()` — the same shared entry point as the production gRPC `PutObject` handler, ensuring batch mode, tier selection, and all FDB operations are identical. GET and DELETE commands call internal methods (`load_object_with_data`, `delete_single`) directly via friend access, bypassing the gRPC handler layer but using the same FDB transaction logic.
 
+## Running N instances on the client
+
+`make deploy` copies the image tarball, `scripts/kvrgw_perf.py` and `scripts/kvrgw_perf.ini` to the client. There, with an existing FDB cluster:
+
+```
+./kvrgw_perf.py run 32 --pin --duration 600   # N docker --perf instances, one tenant each
+./kvrgw_perf.py print-config 32               # show resolved settings/commands, run nothing
+```
+
+Settings live in `kvrgw_perf.ini`; CLI flags, `--set section.key=value` and the old environment variables (`PERF_DURATION`, `PIN`, ...) override it. The image tarball is always docker-loaded first; pick another with `--tarball kvrgw-gw-no-hotspot.tar.gz` (and `--image NAME` if it is tagged differently from `docker.image`). Logs, per-instance metrics and `live.csv` go to `perf-logs/<run-id>/`. This supersedes `perf_multi.sh`, `run_gateway.sh` and `.env`.
+
 ## Setup
 
 ### 1. Build with perf mode

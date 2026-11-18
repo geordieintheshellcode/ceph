@@ -26,7 +26,7 @@ build: docker-image
 		"$(IMAGE)" ./scripts/build_from_tar.sh
 
 # 1) Compile in the build container, then bundle the runtime image tarball and
-# run_gateway.sh into $(DIST).
+# kvrgw_perf.py/kvrgw_perf.ini into $(DIST).
 package: build
 	BUILDX_NO_DEFAULT_ATTESTATIONS=1 DOCKER="$(DOCKER)" "$(POC_DIR)/scripts/package_image.sh" "$(DIST)"
 
@@ -37,10 +37,7 @@ deploy:
 	ssh "$(DEPLOY_HOST)" mkdir -p "$(DEPLOY_DIR)"
 	rsync -av --progress \
 		"$(DIST)/kvrgw-gw.tar.gz" \
-		"$(POC_DIR)/scripts/run_gateway.sh" \
-		"$(POC_DIR)/scripts/s5cmd_smoke_test.sh" \
-		"$(POC_DIR)/scripts/blast_put.sh" \
-		"$(POC_DIR)/scripts/perf_multi.sh" \
-		"$(POC_DIR)/scripts/.env" \
+		"$(POC_DIR)/scripts/kvrgw_perf.py" \
+		"$(POC_DIR)/scripts/kvrgw_perf.ini" \
 		"$(DEPLOY_HOST):$(DEPLOY_DIR)/"
-	@echo "On $(DEPLOY_HOST): cd $(DEPLOY_DIR) && ./run_gateway.sh start && ./s5cmd_smoke_test.sh"
+	@echo "On $(DEPLOY_HOST): cd $(DEPLOY_DIR) && ./kvrgw_perf.py run 8 --pin"

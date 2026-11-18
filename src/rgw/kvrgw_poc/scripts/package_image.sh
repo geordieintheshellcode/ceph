@@ -5,7 +5,8 @@
 #
 # Run scripts/build_from_tar.sh (e.g. via `make shell`) first. Produces
 #   <outdir>/kvrgw-gw.tar.gz   docker image (docker save | gzip)
-#   <outdir>/run_gateway.sh    start script to run on the target machine
+#   <outdir>/kvrgw_perf.py     perf runner to run on the target machine
+#   <outdir>/kvrgw_perf.ini    its config
 # Copy both to the node; nothing else (no repo checkout) is needed there.
 set -euo pipefail
 
@@ -30,6 +31,6 @@ cp -r "$POC/iam" "$STAGE/iam"
 
 mkdir -p "$OUT"
 "$DOCKER" save "$IMAGE" | gzip > "$OUT/kvrgw-gw.tar.gz"
-cp "$POC/scripts/run_gateway.sh" "$OUT/run_gateway.sh"
+cp "$POC/scripts/kvrgw_perf.py" "$POC/scripts/kvrgw_perf.ini" "$OUT/"
 echo "Bundle in $OUT:"
 ls -lh "$OUT"
