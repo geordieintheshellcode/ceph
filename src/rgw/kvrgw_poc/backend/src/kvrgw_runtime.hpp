@@ -34,6 +34,9 @@ namespace kvrgw {
 struct KvRgwStartOptions {
   bool perf_mode = false;
   std::string data_root;
+  // Simulated disk latency; only applied when perf_mode is true.
+  int64_t sim_write_us = 0;
+  int64_t sim_read_us = 0;
 };
 
 class KvRgwRuntime {

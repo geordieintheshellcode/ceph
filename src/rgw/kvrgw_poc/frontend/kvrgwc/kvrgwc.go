@@ -380,6 +380,37 @@ func Start(dataRoot string) (*Handle, int32) {
 	return &Handle{h: out}, 0
 }
 
+// StartOptions configures StartEx. PerfMode selects the in-memory data store
+// (no sweeper/GC threads), with optional simulated disk latency.
+type StartOptions struct {
+	PerfMode   bool
+	DataRoot   string
+	SimWriteUs int64
+	SimReadUs  int64
+}
+
+func StartEx(o StartOptions) (*Handle, int32) {
+	var co C.kvrgw_start_opts
+	if o.PerfMode {
+		co.perf_mode = 1
+	}
+	if o.DataRoot != "" {
+		// The struct holds the pointer, so it must be C memory (cgo pointer rules).
+		cs := C.CString(o.DataRoot)
+		defer C.free(unsafe.Pointer(cs))
+		co.data_root = cs
+		co.data_root_len = C.size_t(len(o.DataRoot))
+	}
+	co.sim_write_us = C.int64_t(o.SimWriteUs)
+	co.sim_read_us = C.int64_t(o.SimReadUs)
+	var out *C.KvRgwHandle
+	ec := C.kvrgw_start_ex(&co, &out)
+	if ec != C.KVRGW_ERR_OK {
+		return nil, int32(ec)
+	}
+	return &Handle{h: out}, 0
+}
+
 func (h *Handle) Stop() {
 	if h == nil || h.h == nil {
 		return

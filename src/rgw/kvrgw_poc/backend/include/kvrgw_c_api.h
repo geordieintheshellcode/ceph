@@ -205,7 +205,19 @@ typedef struct {
   size_t tags_count;
 } kvrgw_copy_args;
 
+typedef struct {
+  /* Non-zero: use the in-memory PerfDataStore and do not start the sweeper/GC
+   * threads (same as the perf driver's --perf mode). */
+  int perf_mode;
+  const char* data_root;
+  size_t data_root_len;
+  /* Simulated disk latency in microseconds; only used when perf_mode != 0. */
+  int64_t sim_write_us;
+  int64_t sim_read_us;
+} kvrgw_start_opts;
+
 kvrgw_err_t kvrgw_start(const char* data_root, size_t data_root_len, KvRgwHandle** out);
+kvrgw_err_t kvrgw_start_ex(const kvrgw_start_opts* opts, KvRgwHandle** out);
 void kvrgw_stop(KvRgwHandle* h);
 
 kvrgw_err_t kvrgw_add_tenant(KvRgwHandle* h, const char* name, size_t name_len, uint32_t* out_id);

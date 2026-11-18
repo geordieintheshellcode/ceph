@@ -200,6 +200,10 @@ bool KvRgwRuntime::start(const KvRgwStartOptions &opts)
 
   ref_tags_.emplace(*rgw_id);
   perf_data_store_.emplace();
+  if (perf_mode_) {
+    perf_data_store_->set_sim_write_us(opts.sim_write_us);
+    perf_data_store_->set_sim_read_us(opts.sim_read_us);
+  }
   file_data_store_.emplace(data_root);
   DataStore &data_store = perf_mode_
                               ? static_cast<DataStore &>(*perf_data_store_)

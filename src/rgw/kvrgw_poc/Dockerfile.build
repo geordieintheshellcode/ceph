@@ -1,10 +1,10 @@
-ARG GO_VERSION=1.25
+ARG GO_VERSION=1.26
 FROM golang:${GO_VERSION} AS go
 
 FROM rockylinux:9
 
-ARG FDB_VERSION=7.3.69
-ARG FDB_SHA256=8678144b4433e24bd4f82c64cdbcf7c0b89ae66449dfbb95b9ce77a69faf7b7e
+ARG FDB_VERSION=7.3.77
+ARG FDB_SHA256=9255a4730655ac1a8461d8da5148a9d87c8978944188477f5b745318bb6d40ba
 
 RUN test "$(uname -m)" = x86_64 \
     && dnf install -y dnf-plugins-core epel-release \

@@ -7,7 +7,7 @@ DEPLOY_DIR ?= dev/rgwkv
 DIST ?= $(POC_DIR)/dist
 
 .DEFAULT_GOAL := shell
-.PHONY: shell docker-image build package deploy
+.PHONY: shell docker-image build package package-capi deploy
 
 docker-image:
 	$(DOCKER) build -t "$(IMAGE)" - < "$(POC_DIR)/Dockerfile.build"
@@ -29,6 +29,11 @@ build: docker-image
 # kvrgw_perf.py/kvrgw_perf.ini into $(DIST).
 package: build
 	BUILDX_NO_DEFAULT_ATTESTATIONS=1 DOCKER="$(DOCKER)" "$(POC_DIR)/scripts/package_image.sh" "$(DIST)"
+
+# Bundle libkvrgw.so, libfdb_c.so, kvrgw_c_api.h and kvrgw.yaml into
+# $(DIST)/kvrgw-capi.tar.gz for cgo consumers such as k11 (build it first).
+package-capi: build
+	"$(POC_DIR)/scripts/package_capi.sh" "$(DIST)"
 
 # Copy an already-built bundle to $(DEPLOY_HOST):$(DEPLOY_DIR) (relative to $HOME).
 # Run `make package` first.

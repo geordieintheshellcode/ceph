@@ -269,8 +269,17 @@ extern "C" {
 kvrgw_err_t kvrgw_start(const char *data_root, size_t data_root_len,
                         KvRgwHandle **out)
 {
+  kvrgw_start_opts o{};
+  o.data_root = data_root;
+  o.data_root_len = data_root_len;
+  return kvrgw_start_ex(&o, out);
+}
+
+kvrgw_err_t kvrgw_start_ex(const kvrgw_start_opts *start_opts,
+                           KvRgwHandle **out)
+{
   return abi_guard([&]() -> kvrgw_err_t {
-    if (out == nullptr) {
+    if (out == nullptr || start_opts == nullptr) {
       return KVRGW_ERR_INVALID_ARGUMENT;
     }
     *out = nullptr;
@@ -279,8 +288,11 @@ kvrgw_err_t kvrgw_start(const char *data_root, size_t data_root_len,
       return KVRGW_ERR_INTERNAL;
     }
     kvrgw::KvRgwStartOptions opts;
-    opts.perf_mode = false;
-    opts.data_root = std::string(sv(data_root, data_root_len));
+    opts.perf_mode = start_opts->perf_mode != 0;
+    opts.data_root =
+        std::string(sv(start_opts->data_root, start_opts->data_root_len));
+    opts.sim_write_us = start_opts->sim_write_us;
+    opts.sim_read_us = start_opts->sim_read_us;
     if (!rt->start(opts)) {
       delete rt;
       return KVRGW_ERR_INTERNAL;

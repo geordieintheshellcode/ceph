@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="${ROOT}/third_party/fdb"
-VER="${FDB_VERSION:-7.3.69}"
+VER="${FDB_VERSION:-7.3.77}"
 
 if [[ "$(uname -m)" != x86_64 ]]; then
   echo "ERROR: fetch_fdb.sh currently supports x86_64 only" >&2
