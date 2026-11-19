@@ -29,6 +29,7 @@ void MetricStats::merge(const MetricStats &o)
   count += o.count;
   errors += o.errors;
   sum_micros += o.sum_micros;
+  for (const auto &[k, v] : o.error_codes) error_codes[k] += v;
   if (!o.hist.empty()) {
     if (hist.empty()) {
       hist.assign(kHistBuckets, 0);
@@ -45,10 +46,29 @@ void ThreadStats::record(Metric m, uint64_t micros)
   w_[static_cast<size_t>(m)].record(micros);
 }
 
-void ThreadStats::record_error(Metric m)
+void ThreadStats::record_error(Metric m, const std::string &code)
 {
   std::lock_guard<std::mutex> g(mu_);
-  ++w_[static_cast<size_t>(m)].errors;
+  auto &s = w_[static_cast<size_t>(m)];
+  ++s.errors;
+  ++s.error_codes[code.empty() ? "unknown" : code];
+}
+
+namespace {
+std::mutex g_text_mu;
+std::map<std::string, std::string> g_texts;
+}  // namespace
+
+void register_error_text(const std::string &code, const std::string &text)
+{
+  std::lock_guard<std::mutex> g(g_text_mu);
+  g_texts.emplace(code, text);
+}
+
+std::map<std::string, std::string> error_texts()
+{
+  std::lock_guard<std::mutex> g(g_text_mu);
+  return g_texts;
 }
 
 void ThreadStats::add_units(Metric m, uint64_t n)

@@ -97,7 +97,7 @@ class OverwriteOp : public Operation {
                                                   vid_marker, &res);
           if (ec != kvrgw::KVRGW_ERR_OK) {
             ++f.other;
-            f.sample("list_object_versions " + key + ": " + kvrgw::kvrgw_strerror(ec));
+            f.sample("list_object_versions " + key + ": " + describe_error(ec));
             err = true;
             break;
           }

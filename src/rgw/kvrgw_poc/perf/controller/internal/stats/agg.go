@@ -1,12 +1,17 @@
 package stats
 
 import (
+	"fmt"
+	"sort"
+	"strings"
+
 	pb "kvrgw-perf/gen/perf/v1"
 )
 
 // Metric aggregate for one op type in one window (or cumulative).
 type Metric struct {
 	Count, Errors, SumMicros uint64
+	ErrorCodes               map[string]uint64 // errors by code name
 	Hist                     Hist
 }
 
@@ -14,7 +19,39 @@ func (m *Metric) Merge(o *Metric) {
 	m.Count += o.Count
 	m.Errors += o.Errors
 	m.SumMicros += o.SumMicros
+	for k, v := range o.ErrorCodes {
+		if m.ErrorCodes == nil {
+			m.ErrorCodes = map[string]uint64{}
+		}
+		m.ErrorCodes[k] += v
+	}
 	m.Hist.Merge(o.Hist)
+}
+
+// ShortCode strips the library prefix for display: KVRGW_ERR_TXN_CONFLICT -> TXN_CONFLICT.
+func ShortCode(c string) string { return strings.TrimPrefix(c, "KVRGW_ERR_") }
+
+// FormatErrorCodes renders "TXN_CONFLICT x5, NO_SUCH_BUCKET x1" (largest first).
+func FormatErrorCodes(codes map[string]uint64) string {
+	type kv struct {
+		k string
+		v uint64
+	}
+	var l []kv
+	for k, v := range codes {
+		l = append(l, kv{k, v})
+	}
+	sort.Slice(l, func(i, j int) bool {
+		if l[i].v != l[j].v {
+			return l[i].v > l[j].v
+		}
+		return l[i].k < l[j].k
+	})
+	parts := make([]string, len(l))
+	for i, e := range l {
+		parts[i] = fmt.Sprintf("%s x%d", ShortCode(e.k), e.v)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (m *Metric) Empty() bool { return m.Count == 0 && m.Errors == 0 }
@@ -25,6 +62,12 @@ func IsCounter(op string) bool { return op == "keys_listed" || op == "keys_delet
 // FromProto converts an OpStats message.
 func FromProto(o *pb.OpStats) Metric {
 	m := Metric{Count: o.Count, Errors: o.Errors, SumMicros: o.SumMicros}
+	if len(o.ErrorCodes) > 0 {
+		m.ErrorCodes = map[string]uint64{}
+		for k, v := range o.ErrorCodes {
+			m.ErrorCodes[k] = v
+		}
+	}
 	if o.Latency != nil {
 		m.Hist.AddSparse(o.Latency.BucketIndex, o.Latency.BucketCount)
 	}

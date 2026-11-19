@@ -45,6 +45,7 @@ Bring FDB up yourself; the harness only reads from a running cluster. Set
     kvrgw-perf run-put-object --duration 60s
     kvrgw-perf run-list-objects --duration 30s
     kvrgw-perf report perf-results/<dir> --warmup 10s
+    kvrgw-perf report perf-results/<dir> --warmup 10s --window 30s   # widen the windows
 
 All settings live in one file, [kvrgw-perf.yaml](kvrgw-perf.yaml), which lists every default
 explicitly. It is found via `--config`, else `./kvrgw-perf.yaml`, else next to the
@@ -62,7 +63,7 @@ layout config. `run-*` commands take exactly one of `--ops N` / `--duration D`.
 Local mode (the only mode in v1) spawns `worker_count` workers on `127.0.0.1:<base-port+i>`;
 `--cpus 0-15` splits a CPU pool across them with `taskset`.
 
-Results directory: `config.resolved.json kvrgw.yaml events.csv metrics.csv hist.csv server_stats.csv
+Results directory: `config.resolved.json kvrgw.yaml events.csv metrics.csv errors.csv hist.csv server_stats.csv
 cpu.csv fdb_cluster.csv fdb_process.csv fdb_status_start.json summary.json controller.log
 worker-<i>.log` (spec section 8.1). FDB files are present only if `fdbcli` works.
 
@@ -89,3 +90,15 @@ Exit codes: 0 success, 1 benchmark/verify failure or worker error, 2 usage.
 - The library never calls its FDB get/commit/scan timing hooks, so the report's server-side section shows only `avg_total` (and `disk` when non-zero).
 - `fdbcli_path` defaults to `/opt/foundationdb/usr/bin/fdbcli`; if absent it falls back to `PATH`, then next to the binary, `/opt/kvrgw`.
 - `cpu.csv`/report show system CPU in cores-equivalent (no CPU count is recorded).
+- Errors are counted per library error code (`KVRGW_ERR_*`). The live window line shows
+  `err=N [NO_SUCH_BUCKET x5, ...]`, `errors.csv` has one row per (window, op, code),
+  `summary.json` has `error_codes` and `error_descriptions` (the `kvrgw_strerror` text), and
+  `report` lists them under each op. Fatal errors name the bucket, an abbreviated key, the code
+  and its text; failed `list_objects` calls are logged (first 20 per worker) as well as counted.
+  A run whose only problems are counted, non-fatal errors (e.g. `list_objects`) still exits 0.
+- `report --window D` widens the client-ops table to windows of D (a whole multiple of the
+  recorded `report_interval_ms`; it cannot narrow windows). Counts, errors and rates are
+  summed over the group, and p50/p99 come from the merged per-window histograms (not
+  averaged). A trailing group of fewer windows is left out of the table but still counted in
+  `Totals:`. CPU, FDB and server-side sections are unaffected. To see finer detail, record
+  with a smaller `report_interval_ms`.

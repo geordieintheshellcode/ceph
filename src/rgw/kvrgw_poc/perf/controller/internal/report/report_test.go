@@ -70,6 +70,13 @@ func fixture(t *testing.T, failed bool) string {
 		Verify: &results.VerifySummary{Ran: true, Pass: true, DurationMs: 41000, Buckets: make([]results.BucketVerify, 4)}}
 	sum.Parameters.ReportIntervalMs = 1000
 	sum.Parameters.WorkerCount, sum.Parameters.ThreadsPerWorker, sum.Parameters.NumBuckets = 4, 8, 4
+	sum.Totals = map[string]results.OpTotals{"put_object": {Errors: 6}}
+	sum.ErrorDescriptions = map[string]string{"KVRGW_ERR_TXN_CONFLICT": "Transaction conflict"}
+	var e strings.Builder
+	e.WriteString("unix_ts_ms,window,op_type,error_code,count\n")
+	fmt.Fprintf(&e, "%d,3,put_object,KVRGW_ERR_TXN_CONFLICT,4\n", start+4000)  // inside the window with a 2s warmup
+	fmt.Fprintf(&e, "%d,0,put_object,KVRGW_ERR_TXN_CONFLICT,50\n", start+1000) // before a 2s warmup
+	w("errors.csv", e.String())
 	b, _ := json.Marshal(sum)
 	w("summary.json", string(b))
 	return dir
@@ -99,20 +106,31 @@ func TestWarmupWindowing(t *testing.T) {
 		t.Fatal("warmup in header")
 	}
 	// Totals: sum 1100..2000 = 15500 ops from merged hist windows only.
-	if !strings.Contains(out, "Totals: 15,500 ops") {
+	// 15,500 ops over the 10s analysed window => 1,550 ops/s average; latencies in ms (3 s.f.)
+	if !strings.Contains(out, "Totals: 15,500 ops (0 errors)   avg 1,550 ops/s") || !strings.Contains(out, "p50=0.146ms") {
 		t.Fatalf("totals:\n%s", out)
 	}
 	if !strings.Contains(out, "Verify    : PASS  (4 buckets") {
 		t.Fatalf("verify line:\n%s", out)
 	}
 	// server stats diffed over the window: 100 ops per window x 10 windows... count delta = 2000-1000.
-	if !strings.Contains(out, "avg_total_us") || !strings.Contains(out, "PutObject            1,000           500") ||
+	if !strings.Contains(out, "avg_total_ms") || !hasRow(out, "PutObject", "1,000", "0.500") ||
 		strings.Contains(out, "avg_fdb") || strings.Contains(out, "commit=") {
 		t.Fatalf("server avg:\n%s", out)
 	}
 	// worker CPU and system CPU present
 	if !strings.Contains(out, "worker 0") || !strings.Contains(out, "system (host)") {
 		t.Fatalf("cpu section:\n%s", out)
+	}
+}
+
+func TestErrorBreakdown(t *testing.T) {
+	out, _ := render(t, fixture(t, false), Options{Warmup: 2 * time.Second})
+	if !strings.Contains(out, "errors: TXN_CONFLICT") || !strings.Contains(out, "x4  Transaction conflict") {
+		t.Fatalf("breakdown missing or wrong:\n%s", out)
+	}
+	if strings.Contains(out, "x54") || strings.Contains(out, "x50") {
+		t.Fatal("rows before the warmup boundary must be excluded")
 	}
 }
 
@@ -179,5 +197,72 @@ func TestExitCodes(t *testing.T) {
 	empty := t.TempDir()
 	if _, code := render(t, empty, Options{}); code != 2 {
 		t.Fatalf("no events.csv => 2, got %d", code)
+	}
+}
+
+// hasRow reports whether some output line has exactly these whitespace-separated fields.
+func hasRow(out string, fields ...string) bool {
+	for _, l := range strings.Split(out, "\n") {
+		if f := strings.Fields(l); len(f) == len(fields) && strings.Join(f, " ") == strings.Join(fields, " ") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestWiden(t *testing.T) {
+	dir := fixture(t, false)
+	// Warmup 10s => recorded windows 10..19 (rates 1100..2000). 5s windows => two buckets:
+	// (1100+..+1500)/5 = 1300 ops/s and (1600+..+2000)/5 = 1800 ops/s.
+	out, code := render(t, dir, Options{Warmup: 10 * time.Second, Window: 5 * time.Second})
+	if code != 0 {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if !strings.Contains(out, "(2 windows of 5s)") {
+		t.Fatalf("header:\n%s", out)
+	}
+	var ops, p50 string
+	for _, l := range strings.Split(out, "\n") {
+		switch f := strings.Fields(l); {
+		case len(f) > 0 && f[0] == "ops/sec":
+			ops = l
+		case len(f) > 0 && f[0] == "p50_ms":
+			p50 = l
+		}
+	}
+	if f := strings.Fields(ops); len(f) < 3 || f[1] != "1,300" || f[2] != "1,800" {
+		t.Fatalf("ops/sec min/max wrong: %q", ops)
+	}
+	// Percentiles come from the merged histograms (fixture: bucket 100 => 146us), not the
+	// per-window p50 column (1000us).
+	if !strings.Contains(p50, "0.146") {
+		t.Fatalf("p50 should come from merged histograms: %q", p50)
+	}
+	// Totals still cover every recorded window in range.
+	if !strings.Contains(out, "Totals: 15,500 ops") {
+		t.Fatalf("totals:\n%s", out)
+	}
+}
+
+func TestWidenDropsTrailingPartialWindow(t *testing.T) {
+	// 20 recorded windows in range; 8s windows => 2 complete (16 windows), 4 left over.
+	out, _ := render(t, fixture(t, false), Options{Window: 8 * time.Second})
+	if !strings.Contains(out, "(2 windows of 8s)") || !strings.Contains(out, "Totals: 21,000 ops") {
+		t.Fatalf("\n%s", out)
+	}
+}
+
+func TestWidenValidation(t *testing.T) {
+	dir := fixture(t, false)
+	for _, w := range []time.Duration{1500 * time.Millisecond, 500 * time.Millisecond, 60 * time.Second} {
+		if out, code := render(t, dir, Options{Warmup: 10 * time.Second, Window: w}); code != 2 {
+			t.Errorf("--window %s: want exit 2, got %d\n%s", w, code, out)
+		}
+	}
+	// same as recorded size is allowed and equals the default output
+	a, _ := render(t, dir, Options{Window: time.Second})
+	b, _ := render(t, dir, Options{})
+	if a != b {
+		t.Fatal("--window equal to the recorded window must not change the report")
 	}
 }

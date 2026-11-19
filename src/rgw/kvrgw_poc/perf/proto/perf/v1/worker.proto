@@ -61,6 +61,7 @@ message ProgressReport {
   repeated OpStats cumulative_stats = 5; // full snapshot, not delta
   int64 cumulative_as_of_unix_ns = 6;
   ServerStats server_stats = 7; // cumulative snapshot of in-process kvrgw stats
+  map<string, string> error_descriptions = 8; // error code name -> human-readable text
 }
 // Snapshot of the worker's in-process kvrgw statistics (the same counters the
 // legacy admin socket exposed via get-latency / get-batch-stats / get-error-stats).
@@ -94,6 +95,7 @@ message OpStats {
   uint64 errors = 3;
   uint64 sum_micros = 4;
   Histogram latency = 5;       // empty for counter-style types (count = units)
+  map<string, uint64> error_codes = 6; // errors by code name (sum == errors, same window/cumulative scope)
 }
 message Histogram { repeated uint32 bucket_index = 1; repeated uint64 bucket_count = 2; }
 message VerifyResult {

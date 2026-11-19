@@ -7,6 +7,36 @@
 
 namespace perfw {
 
+std::string short_key(const std::string &key)
+{
+  // Keys carry a long random prefix; keep the head and the tail (which holds the id).
+  if (key.size() <= 48) return key;
+  return key.substr(0, 12) + "..." + key.substr(key.size() - 24);
+}
+
+std::string describe_error(kvrgw::KvrgwErrorCode ec)
+{
+  return std::string(kvrgw::KvrgwErrorCode_Name(ec)) + " (" + kvrgw::kvrgw_strerror(ec) + ")";
+}
+
+void record_op_error(ThreadStats &ts, Metric m, kvrgw::KvrgwErrorCode ec)
+{
+  const std::string name = kvrgw::KvrgwErrorCode_Name(ec);
+  register_error_text(name, kvrgw::kvrgw_strerror(ec));
+  ts.record_error(m, name);
+}
+
+void log_op_error(const std::string &what, const std::string &err)
+{
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 20) {
+    // One write per line: several threads log concurrently.
+    const std::string line = what + " failed: " + err + "\n";
+    std::cerr.write(line.data(), static_cast<std::streamsize>(line.size()));
+    std::cerr.flush();
+  }
+}
+
 bool RunContext::wait_start() const
 {
   while (!stopped()) {
@@ -23,7 +53,7 @@ std::string ServiceLister::list(const std::string &prefix, uint32_t max_keys,
 {
   kvrgw::KvRgwServiceImpl::ListObjectsResult res;
   auto ec = svc_.list_objects(tenant_, bucket_, prefix, "", max_keys, token, "", &res);
-  if (ec != kvrgw::KVRGW_ERR_OK) return kvrgw::kvrgw_strerror(ec);
+  if (ec != kvrgw::KVRGW_ERR_OK) return describe_error(ec);
   out->keys.clear();
   out->keys.reserve(res.objects.size());
   for (auto &o : res.objects) out->keys.push_back(std::move(o.key));
@@ -53,16 +83,13 @@ bool put_with_retry(RunContext &ctx, ThreadStats &ts, const std::string &bucket,
       return true;
     }
     last = res.error_code;
-    ts.record_error(Metric::PutObject);
-    static std::atomic<int> logged{0};
-    if (logged.fetch_add(1) < 20) {
-      std::cerr << "put_object " << bucket << "/" << key
-                << " failed: " << kvrgw::kvrgw_strerror(last) << " (attempt " << a + 1 << ")\n";
-    }
+    record_op_error(ts, Metric::PutObject, last);
+    log_op_error("put_object " + bucket + "/" + short_key(key) + " (attempt " + std::to_string(a + 1) + ")",
+                 describe_error(last));
   }
   if (!ctx.stopped()) {
-    ctx.fail(std::string("put_object failed after ") + std::to_string(kAttempts) +
-             " attempts: " + kvrgw::kvrgw_strerror(last));
+    ctx.fail("put_object " + bucket + "/" + short_key(key) + " failed after " + std::to_string(kAttempts) +
+             " attempts: " + describe_error(last));
   }
   return false;
 }
@@ -96,14 +123,14 @@ std::string check_buckets(RunContext &ctx, const std::vector<uint64_t> &buckets,
     bool exists = false;
     auto ec = ctx.svc->bucket_exists(ctx.tenant, ctx.bucket(b), &exists);
     if (ec != kvrgw::KVRGW_ERR_OK) {
-      return "bucket_exists " + ctx.bucket(b) + ": " + kvrgw::kvrgw_strerror(ec);
+      return "bucket_exists " + ctx.bucket(b) + ": " + describe_error(ec);
     }
     if (!exists) return "bucket " + ctx.bucket(b) + " does not exist (run load first)";
     if (require_versioning) {
       kvrgw::VersioningState st{};
       ec = ctx.svc->get_bucket_versioning(ctx.tenant, ctx.bucket(b), &st);
       if (ec != kvrgw::KVRGW_ERR_OK) {
-        return "get_bucket_versioning " + ctx.bucket(b) + ": " + kvrgw::kvrgw_strerror(ec);
+        return "get_bucket_versioning " + ctx.bucket(b) + ": " + describe_error(ec);
       }
       if (st != kvrgw::VERSIONING_ENABLED) {
         return "bucket " + ctx.bucket(b) + " does not have versioning enabled";

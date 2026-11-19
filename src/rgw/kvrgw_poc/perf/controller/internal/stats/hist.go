@@ -4,8 +4,10 @@
 package stats
 
 import (
+	"fmt"
 	"math/bits"
 	"sort"
+	"strconv"
 )
 
 const (
@@ -128,6 +130,43 @@ func (h Hist) Sparse() (idx []int, cnt []uint64) {
 	}
 	return
 }
+
+// MsNum renders a latency given in microseconds as milliseconds with 3 significant figures
+// (no unit): 5772 -> "5.77", 10070 -> "10.1", 234 -> "0.234", 1234567 -> "1,235".
+func MsNum(us float64) string {
+	ms := us / 1000
+	a := ms
+	if a < 0 {
+		a = -a
+	}
+	switch {
+	case ms == 0:
+		return "0"
+	case a >= 1000:
+		s := strconv.FormatInt(int64(ms+0.5), 10)
+		var out []byte
+		for i, c := range []byte(s) {
+			if i > 0 && (len(s)-i)%3 == 0 {
+				out = append(out, ',')
+			}
+			out = append(out, c)
+		}
+		return string(out)
+	case a >= 100:
+		return fmt.Sprintf("%.0f", ms)
+	case a >= 10:
+		return fmt.Sprintf("%.1f", ms)
+	case a >= 1:
+		return fmt.Sprintf("%.2f", ms)
+	case a >= 0.1:
+		return fmt.Sprintf("%.3f", ms)
+	default:
+		return fmt.Sprintf("%.4f", ms)
+	}
+}
+
+// Ms is MsNum with a unit suffix.
+func Ms(us float64) string { return MsNum(us) + "ms" }
 
 // Summary stats (min max avg median p90 p95 p99 dev%) over a sample series.
 type Summary struct {

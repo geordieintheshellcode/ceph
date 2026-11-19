@@ -33,6 +33,7 @@ void fill_stats(const StatsArray &a, google::protobuf::RepeatedPtrField<perf::v1
     o->set_count(m.count);
     o->set_errors(m.errors);
     o->set_sum_micros(m.sum_micros);
+    for (const auto &[code, n] : m.error_codes) (*o->mutable_error_codes())[code] = n;
     if (!metric_is_counter(static_cast<Metric>(i))) fill_hist(m, o->mutable_latency());
   }
 }
@@ -105,13 +106,13 @@ std::string WorkerService::do_init(const perf::v1::InitRequest &req)
     for (;;) {
       bool exists = false;
       auto ec = svc.resolve_tenant(cfg.tenant_name, &exists, &ctx->tenant);
-      if (ec != kvrgw::KVRGW_ERR_OK) return std::string("resolve_tenant: ") + kvrgw::kvrgw_strerror(ec);
+      if (ec != kvrgw::KVRGW_ERR_OK) return std::string("resolve_tenant: ") + describe_error(ec);
       if (exists && ctx->tenant != 0) break;
       if (ctx->worker_index == 0) {
         kvrgw::tenant_id_t created = 0;
         ec = svc.add_tenant(cfg.tenant_name, &created);
         if (ec != kvrgw::KVRGW_ERR_OK && ec != kvrgw::KVRGW_ERR_TENANT_ALREADY_EXISTS) {
-          return std::string("add_tenant: ") + kvrgw::kvrgw_strerror(ec);
+          return std::string("add_tenant: ") + describe_error(ec);
         }
         continue;
       }
@@ -217,6 +218,7 @@ grpc::Status WorkerService::RunBenchmark(
     auto win = stats_->collect_window();
     fill_stats(win, p->mutable_window_stats());
     fill_stats(stats_->cumulative(), p->mutable_cumulative_stats());
+    for (const auto &[code, text] : error_texts()) (*p->mutable_error_descriptions())[code] = text;
     p->set_cumulative_as_of_unix_ns(sys_now_ns());
     fill_server_stats(p->mutable_server_stats());
     s->Write(ev);

@@ -29,7 +29,7 @@ commands:
   run-put-object-overwrite-versioned   overwrite and verify version counts
   run-delete-multi                     batch deletes (destructive)
   report <results-dir>                 analyse a results directory
-        [--warmup D] [--deviation N] [--per-server]
+        [--warmup D] [--window D] [--deviation N] [--per-server]
 
 global flags:
   --config FILE          harness config (default: ./kvrgw-perf.yaml, else next to the binary)
@@ -204,6 +204,7 @@ func runReport(args []string) int {
 	warmup := fs.String("warmup", "0s", "duration of the benchmark start to ignore")
 	fs.Float64Var(&o.Deviation, "deviation", 10, "percent deviation from the median counted by dev%")
 	fs.BoolVar(&o.PerServer, "per-server", false, "one FDB line per process")
+	window := fs.String("window", "0s", "widen the client-ops windows to this size (multiple of the recorded window)")
 	// Accept flags before or after the results directory.
 	var dir string
 	for len(args) > 0 {
@@ -220,7 +221,7 @@ func runReport(args []string) int {
 		}
 	}
 	if dir == "" {
-		fmt.Fprintln(os.Stderr, "usage: kvrgw-perf report <results-dir> [--warmup D] [--deviation N] [--per-server]")
+		fmt.Fprintln(os.Stderr, "usage: kvrgw-perf report <results-dir> [--warmup D] [--window D] [--deviation N] [--per-server]")
 		return 2
 	}
 	d, err := time.ParseDuration(*warmup)
@@ -229,5 +230,11 @@ func runReport(args []string) int {
 		return 2
 	}
 	o.Warmup = d
+	wd, err := time.ParseDuration(*window)
+	if err != nil || wd < 0 {
+		fmt.Fprintf(os.Stderr, "invalid --window %q\n", *window)
+		return 2
+	}
+	o.Window = wd
 	return report.Run(os.Stdout, dir, o)
 }

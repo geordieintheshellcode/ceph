@@ -133,6 +133,15 @@ std::string verify_load_family(RunContext &ctx, const std::vector<uint64_t> &buc
 std::string check_buckets(RunContext &ctx, const std::vector<uint64_t> &buckets,
                           bool require_versioning);
 
+// Abbreviated key for messages: head + "..." + tail (the tail holds the key id).
+std::string short_key(const std::string &key);
+// "KVRGW_ERR_X (readable text)".
+std::string describe_error(kvrgw::KvrgwErrorCode ec);
+// Count an error against `m` under the library's code name (and register its text).
+void record_op_error(ThreadStats &ts, Metric m, kvrgw::KvrgwErrorCode ec);
+// Rate-limited (first 20 per process) stderr log line for a failed operation.
+void log_op_error(const std::string &what, const std::string &err);
+
 inline int64_t elapsed_us(SteadyClock::time_point t0)
 {
   return std::chrono::duration_cast<std::chrono::microseconds>(SteadyClock::now() - t0).count();

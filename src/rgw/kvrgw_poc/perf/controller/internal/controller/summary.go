@@ -12,7 +12,7 @@ func (v *invocation) buildSummary(exit int) *results.Summary {
 	s := &results.Summary{
 		Command: v.o.Command, BenchmarkID: v.benchID, Parameters: v.o.Cfg,
 		RunStartUnixS: v.startS, Totals: map[string]results.OpTotals{},
-		ServerTotals: v.lastServer, Verify: v.verifySum, ExitStatus: exit,
+		ServerTotals: v.lastServer, ErrorDescriptions: v.errDescs, Verify: v.verifySum, ExitStatus: exit,
 		Failed: exit != 0, Failures: v.failures,
 	}
 	secs := float64(v.benchEndMs-v.runStartMs) / 1000
@@ -21,7 +21,7 @@ func (v *invocation) buildSummary(exit int) *results.Summary {
 		if m == nil {
 			continue
 		}
-		t := results.OpTotals{Count: m.Count, Errors: m.Errors}
+		t := results.OpTotals{Count: m.Count, Errors: m.Errors, ErrorCodes: m.ErrorCodes}
 		if secs > 0 {
 			t.OpsPerSec = float64(m.Count) / secs
 		}
@@ -59,6 +59,13 @@ func (v *invocation) printFinal(s *results.Summary) {
 		fmt.Fprintf(v.out, "  %-13s ops=%s  %s ops/s  mean=%s p50=%s p90=%s p99=%s p999=%s max=%s  errors=%d\n",
 			op, human(float64(t.Count)), human(t.OpsPerSec), fmtUs(uint64(t.MeanUs)), fmtUs(t.P50Us),
 			fmtUs(t.P90Us), fmtUs(t.P99Us), fmtUs(t.P999Us), fmtUs(t.MaxUs), t.Errors)
+		for _, code := range sortedKeys(t.ErrorCodes) {
+			line := fmt.Sprintf("      %-30s x%d", stats.ShortCode(code), t.ErrorCodes[code])
+			if d := s.ErrorDescriptions[code]; d != "" {
+				line += "  " + d
+			}
+			fmt.Fprintln(v.out, line)
+		}
 	}
 	if vs := s.Verify; vs != nil {
 		st := "PASS"

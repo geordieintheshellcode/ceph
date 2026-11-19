@@ -23,6 +23,9 @@ type Options struct {
 	Warmup    time.Duration
 	Deviation float64
 	PerServer bool
+	// Window widens the recorded windows of the client-ops table to this size (0 = as
+	// recorded). It must be a whole multiple of the recorded window.
+	Window time.Duration
 }
 
 // Exit codes: 0 ok, 1 summary records a failed run, 2 unreadable results dir.
@@ -32,6 +35,10 @@ func Run(w io.Writer, dir string, o Options) int {
 	}
 	r, err := load(dir)
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "report:", err)
+		return 2
+	}
+	if err := r.checkWindow(o); err != nil {
 		fmt.Fprintln(os.Stderr, "report:", err)
 		return 2
 	}
@@ -59,13 +66,22 @@ type data struct {
 	startMs, endMs int64
 	metrics        []metricRow
 	hist           map[string]map[int64]stats.Hist // op -> window -> hist
-	server         map[string][]sample             // name -> series
+	errCodes       []errRow
+	wend           map[int64]int64     // window index -> window end (unix ms)
+	server         map[string][]sample // name -> series
 	cpu            map[string][]sample
 	fdbCluster     map[string][]sample // column -> series
 	fdbProc        map[procKey]map[string][]sample
 	sum            *results.Summary
 	intervalMs     int64
 	hasFDB         bool
+}
+
+type errRow struct {
+	ts    int64
+	op    string
+	code  string
+	count uint64
 }
 
 type sample struct {
@@ -98,7 +114,7 @@ func pi(s string) int64   { v, _ := strconv.ParseInt(s, 10, 64); return v }
 func pu(s string) uint64  { v, _ := strconv.ParseUint(s, 10, 64); return v }
 
 func load(dir string) (*data, error) {
-	d := &data{dir: dir, hist: map[string]map[int64]stats.Hist{}, server: map[string][]sample{},
+	d := &data{dir: dir, wend: map[int64]int64{}, hist: map[string]map[int64]stats.Hist{}, server: map[string][]sample{},
 		cpu: map[string][]sample{}, fdbCluster: map[string][]sample{}, fdbProc: map[procKey]map[string][]sample{}}
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		return nil, fmt.Errorf("cannot read results directory %q", dir)
@@ -139,6 +155,15 @@ func load(dir string) (*data, error) {
 				m.meanUs, m.p50, m.p99 = pf(r[6]), pf(r[7]), pf(r[9])
 			}
 			d.metrics = append(d.metrics, m)
+			d.wend[m.window] = m.ts
+		}
+	}
+	// errors.csv (optional: only written when errors occurred)
+	if _, rows, err := readCSV(filepath.Join(dir, "errors.csv")); err == nil {
+		for _, r := range rows {
+			if len(r) >= 5 {
+				d.errCodes = append(d.errCodes, errRow{pi(r[0]), r[2], r[3], pu(r[4])})
+			}
 		}
 	}
 	// hist.csv
@@ -249,21 +274,20 @@ func num(v float64) string {
 	}
 }
 
-func dur(us float64) string {
-	switch {
-	case us >= 1e6:
-		return fmt.Sprintf("%.2fs", us/1e6)
-	case us >= 1e3:
-		return fmt.Sprintf("%.1fms", us/1e3)
-	}
-	return fmt.Sprintf("%.0fus", us)
-}
-
 func clock(ms int64) string { return time.UnixMilli(ms).UTC().Format("15:04:05Z") }
 
 func row(w io.Writer, label string, s stats.Summary, showDev bool) {
-	fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s", label, num(s.Min), num(s.Max), num(s.Avg), num(s.Median),
-		num(s.P90), num(s.P95), num(s.P99))
+	rowF(w, label, s, showDev, num)
+}
+
+// rowMs prints a row whose samples are latencies in microseconds, in ms to 3 significant figures.
+func rowMs(w io.Writer, label string, s stats.Summary, showDev bool) {
+	rowF(w, label, s, showDev, stats.MsNum)
+}
+
+func rowF(w io.Writer, label string, s stats.Summary, showDev bool, f func(float64) string) {
+	fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s", label, f(s.Min), f(s.Max), f(s.Avg), f(s.Median),
+		f(s.P90), f(s.P95), f(s.P99))
 	if showDev {
 		fmt.Fprintf(w, "%7.1f%%", s.DevPct)
 	}
@@ -277,13 +301,12 @@ func (d *data) print(w io.Writer, o Options) {
 	fmt.Fprintf(w, "%s\n kvrgw-perf report: %s\n%s\n", line, name, line)
 
 	// ---- header ----
-	var nwin int
-	seenWin := map[int64]bool{}
-	for _, m := range d.metrics {
-		if m.ts > from && m.ts <= to && !seenWin[m.window] {
-			seenWin[m.window] = true
-			nwin++
-		}
+	k := d.widen(o)
+	nwin := len(d.windowsInRange(from, to))
+	winLen := time.Duration(d.intervalMs) * time.Millisecond
+	if k > 1 {
+		nwin /= k // complete widened windows only; a trailing partial one is left out of the table
+		winLen *= time.Duration(k)
 	}
 	if d.sum != nil {
 		p := d.sum.Parameters
@@ -291,8 +314,7 @@ func (d *data) print(w io.Writer, o Options) {
 	}
 	fmt.Fprintf(w, " Benchmark : %s -> %s (%.0fs)   Warmup skipped: first %s\n", clock(d.startMs), clock(d.endMs),
 		float64(d.endMs-d.startMs)/1000, o.Warmup)
-	fmt.Fprintf(w, " Analysed  : %s -> %s (%d windows of %s)\n", clock(from), clock(to), nwin,
-		(time.Duration(d.intervalMs) * time.Millisecond).String())
+	fmt.Fprintf(w, " Analysed  : %s -> %s (%d windows of %s)\n", clock(from), clock(to), nwin, winLen.String())
 	if d.sum != nil {
 		if v := d.sum.Verify; v != nil && v.Ran {
 			st := "PASS"
@@ -327,6 +349,11 @@ func (d *data) print(w io.Writer, o Options) {
 }
 
 func (d *data) printClient(w io.Writer, o Options, from, to int64) {
+	// Average rates are over the analysed part of the run (benchmark start+warmup to end).
+	runSecs := float64(to-from) / 1000
+	if runSecs <= 0 {
+		runSecs = 1
+	}
 	ops := []string{}
 	for _, op := range []string{"put_object", "list_objects", "delete_multi", "keys_listed", "keys_deleted"} {
 		for _, m := range d.metrics {
@@ -342,6 +369,17 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 	fmt.Fprintln(w, "\n--- Client ops (cluster total, merged across workers) ---")
 	for _, op := range ops {
 		var rate, mean, p50, p99, errs []float64
+		for _, sm := range d.series(op, from, to, d.widen(o)) {
+			rate = append(rate, sm.rate)
+			errs = append(errs, sm.errs)
+			if sm.hasLat {
+				mean = append(mean, sm.mean)
+				p50 = append(p50, sm.p50)
+				p99 = append(p99, sm.p99)
+			}
+		}
+		// Totals always cover every recorded window in range (including a trailing partial
+		// widened window).
 		var count, errTotal uint64
 		wins := map[int64]bool{}
 		for _, m := range d.metrics {
@@ -349,36 +387,63 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 				continue
 			}
 			wins[m.window] = true
-			rate = append(rate, m.opsPerSec)
-			errs = append(errs, float64(m.errors))
 			count += m.count
 			errTotal += m.errors
-			if m.hasLat && m.count > 0 {
-				mean = append(mean, m.meanUs)
-				p50 = append(p50, m.p50)
-				p99 = append(p99, m.p99)
-			}
 		}
 		if stats.IsCounter(op) {
 			fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", op, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 			row(w, "units/sec", stats.Summarize(rate, o.Deviation), true)
-			fmt.Fprintf(w, " Totals: %s units\n", grouped(int64(count)))
+			fmt.Fprintf(w, " Totals: %s units   avg %s units/s\n", grouped(int64(count)), num(float64(count)/runSecs))
 			continue
 		}
 		fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", op, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 		row(w, "ops/sec", stats.Summarize(rate, o.Deviation), true)
-		row(w, "mean_us", stats.Summarize(mean, o.Deviation), true)
-		row(w, "p50_us", stats.Summarize(p50, o.Deviation), true)
-		row(w, "p99_us", stats.Summarize(p99, o.Deviation), true)
+		rowMs(w, "mean_ms", stats.Summarize(mean, o.Deviation), true)
+		rowMs(w, "p50_ms", stats.Summarize(p50, o.Deviation), true)
+		rowMs(w, "p99_ms", stats.Summarize(p99, o.Deviation), true)
 		row(w, "errors/win", stats.Summarize(errs, o.Deviation), true)
 		// overall quantiles from merged hist windows inside the analysis window
 		var h stats.Hist
 		for win := range wins {
 			h.Merge(d.hist[op][win])
 		}
-		fmt.Fprintf(w, " Totals: %s ops (%s errors)   overall p50=%s p99=%s p999=%s\n", grouped(int64(count)), grouped(int64(errTotal)),
-			dur(float64(h.Quantile(0.5))), dur(float64(h.Quantile(0.99))), dur(float64(h.Quantile(0.999))))
+		fmt.Fprintf(w, " Totals: %s ops (%s errors)   avg %s ops/s   overall p50=%s p99=%s p999=%s\n",
+			grouped(int64(count)), grouped(int64(errTotal)), num(float64(count)/runSecs),
+			stats.Ms(float64(h.Quantile(0.5))), stats.Ms(float64(h.Quantile(0.99))), stats.Ms(float64(h.Quantile(0.999))))
+		d.printErrorCodes(w, op, from, to)
 	}
+}
+
+// printErrorCodes lists the op's errors in the analysis window by library error code, with
+// the readable text recorded in summary.json.
+func (d *data) printErrorCodes(w io.Writer, op string, from, to int64) {
+	codes := map[string]uint64{}
+	for _, e := range d.errCodes {
+		if e.op == op && e.ts > from && e.ts <= to {
+			codes[e.code] += e.count
+		}
+	}
+	for _, c := range sortedByCount(codes) {
+		line := fmt.Sprintf("   errors: %-28s x%d", stats.ShortCode(c), codes[c])
+		if d.sum != nil && d.sum.ErrorDescriptions[c] != "" {
+			line += "  " + d.sum.ErrorDescriptions[c]
+		}
+		fmt.Fprintln(w, line)
+	}
+}
+
+func sortedByCount(m map[string]uint64) []string {
+	k := make([]string, 0, len(m))
+	for s := range m {
+		k = append(k, s)
+	}
+	sort.Slice(k, func(i, j int) bool {
+		if m[k[i]] != m[k[j]] {
+			return m[k[i]] > m[k[j]]
+		}
+		return k[i] < k[j]
+	})
+	return k
 }
 
 func (d *data) printCPU(w io.Writer, from, to int64) {
@@ -471,15 +536,15 @@ func (d *data) printServer(w io.Writer, from, to int64) {
 		rows = append(rows, r)
 	}
 	if len(rows) > 0 {
-		fmt.Fprintf(w, " %-14s%12s%14s", "op", "count", "avg_total_us")
+		fmt.Fprintf(w, " %-14s%12s%14s", "op", "count", "avg_total_ms")
 		if showDisk {
-			fmt.Fprintf(w, "%13s", "avg_disk_us")
+			fmt.Fprintf(w, "%13s", "avg_disk_ms")
 		}
 		fmt.Fprintln(w)
 		for _, r := range rows {
-			fmt.Fprintf(w, " %-14s%12s%14s", r.op, grouped(int64(r.count)), num(r.total))
+			fmt.Fprintf(w, " %-14s%12s%14s", r.op, grouped(int64(r.count)), stats.MsNum(r.total))
 			if showDisk {
-				fmt.Fprintf(w, "%13s", num(r.disk))
+				fmt.Fprintf(w, "%13s", stats.MsNum(r.disk))
 			}
 			fmt.Fprintln(w)
 		}
@@ -740,4 +805,123 @@ func bytesStr(b float64) string {
 		return fmt.Sprintf("%.0fKB", b/1e3)
 	}
 	return fmt.Sprintf("%.0fB", b)
+}
+
+// ---- widening ----
+
+// opSample is one (possibly widened) window of one op.
+type opSample struct {
+	rate, mean, p50, p99, errs float64
+	hasLat                     bool
+}
+
+// windowsInRange returns the distinct recorded window indexes whose end is in (from,to].
+func (d *data) windowsInRange(from, to int64) []int64 {
+	var ws []int64
+	for w, ts := range d.wend {
+		if ts > from && ts <= to {
+			ws = append(ws, w)
+		}
+	}
+	sort.Slice(ws, func(i, j int) bool { return ws[i] < ws[j] })
+	return ws
+}
+
+// widen returns how many recorded windows make up one displayed window (1 = as recorded).
+func (d *data) widen(o Options) int {
+	if o.Window <= 0 || d.intervalMs <= 0 {
+		return 1
+	}
+	return int(o.Window.Milliseconds() / d.intervalMs)
+}
+
+// checkWindow validates --window against the recorded window size.
+func (d *data) checkWindow(o Options) error {
+	if o.Window == 0 {
+		return nil
+	}
+	if d.intervalMs <= 0 { // no summary.json: infer from the first two window ends
+		ws := d.windowsInRange(0, 1<<62)
+		if len(ws) >= 2 {
+			d.intervalMs = d.wend[ws[1]] - d.wend[ws[0]]
+		}
+	}
+	if d.intervalMs <= 0 {
+		return fmt.Errorf("--window: cannot determine the recorded window size")
+	}
+	rec := time.Duration(d.intervalMs) * time.Millisecond
+	if o.Window < rec || o.Window%rec != 0 {
+		return fmt.Errorf("--window %s must be a whole multiple of the recorded window (%s)", o.Window, rec)
+	}
+	from, to := d.bounds(o)
+	if k := d.widen(o); k > 1 && len(d.windowsInRange(from, to)) < k {
+		return fmt.Errorf("--window %s is longer than the analysed range (%d recorded windows of %s)",
+			o.Window, len(d.windowsInRange(from, to)), rec)
+	}
+	return nil
+}
+
+// windowDur is the length of recorded window w in seconds.
+func (d *data) windowDur(w int64) float64 {
+	prev, ok := d.wend[w-1]
+	if !ok {
+		prev = d.startMs + w*d.intervalMs
+	}
+	if s := float64(d.wend[w]-prev) / 1000; s > 0 {
+		return s
+	}
+	return float64(d.intervalMs) / 1000
+}
+
+// series returns the op's samples in (from,to]: one per recorded window (k == 1), or one per
+// complete group of k consecutive recorded windows. Widened percentiles come from the merged
+// per-window histograms (never from averaging percentiles).
+func (d *data) series(op string, from, to int64, k int) []opSample {
+	rows := map[int64]metricRow{}
+	for _, m := range d.metrics {
+		if m.op == op && m.ts > from && m.ts <= to {
+			rows[m.window] = m
+		}
+	}
+	if k <= 1 {
+		var out []opSample
+		for _, w := range d.windowsInRange(from, to) {
+			m, ok := rows[w]
+			if !ok {
+				continue
+			}
+			out = append(out, opSample{rate: m.opsPerSec, errs: float64(m.errors), hasLat: m.hasLat && m.count > 0,
+				mean: m.meanUs, p50: m.p50, p99: m.p99})
+		}
+		return out
+	}
+	all := d.windowsInRange(from, to)
+	var out []opSample
+	for b := 0; (b+1)*k <= len(all); b++ {
+		var count, errors, latCount uint64
+		var latSum, secs float64
+		var h stats.Hist
+		for _, w := range all[b*k : (b+1)*k] {
+			secs += d.windowDur(w)
+			m, ok := rows[w]
+			if !ok {
+				continue
+			}
+			count += m.count
+			errors += m.errors
+			if m.hasLat && m.count > 0 {
+				latCount += m.count
+				latSum += m.meanUs * float64(m.count)
+			}
+			h.Merge(d.hist[op][w])
+		}
+		s := opSample{rate: float64(count) / secs, errs: float64(errors)}
+		if latCount > 0 {
+			s.hasLat = true
+			s.mean = latSum / float64(latCount)
+			s.p50, s.p99 = float64(h.Quantile(0.5)), float64(h.Quantile(0.99))
+		}
+		out = append(out, s)
+	}
+	return out
 }

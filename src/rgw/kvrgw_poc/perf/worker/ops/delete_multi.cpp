@@ -57,18 +57,20 @@ class DeleteMultiOp : public Operation {
       ++calls;
       std::string bad;
       if (ec != kvrgw::KVRGW_ERR_OK) {
-        bad = kvrgw::kvrgw_strerror(ec);
+        bad = describe_error(ec);
+        record_op_error(ts, Metric::DeleteMulti, ec);
       } else {
         for (const auto &o : outcomes) {
           if (o.status == kvrgw::KvRgwServiceImpl::DeleteMultiKeyOutcome::Status::Error) {
-            bad = "key " + o.key + ": " + o.error_code + " " + o.error_message;
+            bad = "key " + o.key + ": " + o.error_code + " (" + o.error_message + ")";
+            register_error_text(o.error_code, o.error_message);
+            ts.record_error(Metric::DeleteMulti, o.error_code);
             break;
           }
         }
       }
       if (!bad.empty()) {
-        ts.record_error(Metric::DeleteMulti);
-        ctx.fail("delete_multi failed: " + bad);
+        ctx.fail("delete_multi " + ctx.bucket(bucket) + " failed: " + bad);
         break;
       }
       ts.record(Metric::DeleteMulti, us);

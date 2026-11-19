@@ -47,7 +47,8 @@ class ListObjectsOp : public Operation {
       }
       ++done;
       if (ec != kvrgw::KVRGW_ERR_OK) {
-        ts.record_error(Metric::ListObjects);
+        record_op_error(ts, Metric::ListObjects, ec);
+        log_op_error("list_objects " + ctx.bucket(b) + " prefix '" + *prefix + "'", describe_error(ec));
         token.clear();
         cur = (cur + 1) % items.size();
         continue;

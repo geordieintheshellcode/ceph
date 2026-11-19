@@ -5,8 +5,10 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace perfw {
@@ -27,6 +29,7 @@ struct MetricStats {
   uint64_t count = 0;   // successes (or units for counter metrics)
   uint64_t errors = 0;
   uint64_t sum_micros = 0;
+  std::map<std::string, uint64_t> error_codes;  // by code name; sums to `errors`
   std::vector<uint64_t> hist;  // empty or kHistBuckets
 
   void record(uint64_t micros);
@@ -40,7 +43,7 @@ using StatsArray = std::array<MetricStats, kMetricCount>;
 class ThreadStats {
  public:
   void record(Metric m, uint64_t micros);
-  void record_error(Metric m);
+  void record_error(Metric m, const std::string &code = {});
   void add_units(Metric m, uint64_t n);
   // Swap out the current window.
   StatsArray take_window();
@@ -49,6 +52,10 @@ class ThreadStats {
   std::mutex mu_;
   StatsArray w_;
 };
+
+// Process-wide table of error code name -> human-readable text (for reports).
+void register_error_text(const std::string &code, const std::string &text);
+std::map<std::string, std::string> error_texts();
 
 class StatsHub {
  public:

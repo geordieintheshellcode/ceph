@@ -17,7 +17,7 @@ class LoadOp : public Operation {
       bool exists = false;
       auto ec = ctx.svc->bucket_exists(ctx.tenant, ctx.bucket(b), &exists);
       if (ec != kvrgw::KVRGW_ERR_OK) {
-        return "bucket_exists " + ctx.bucket(b) + ": " + kvrgw::kvrgw_strerror(ec);
+        return "bucket_exists " + ctx.bucket(b) + ": " + describe_error(ec);
       }
       if (exists) {
         return "bucket " + ctx.bucket(b) + " already exists (clean up before load)";
@@ -26,12 +26,12 @@ class LoadOp : public Operation {
     for (uint64_t b = 0; b < ctx.cfg.num_buckets; ++b) {
       auto ec = ctx.svc->create_bucket(ctx.tenant, ctx.bucket(b));
       if (ec != kvrgw::KVRGW_ERR_OK) {
-        return "create_bucket " + ctx.bucket(b) + ": " + kvrgw::kvrgw_strerror(ec) +
+        return "create_bucket " + ctx.bucket(b) + ": " + describe_error(ec) +
                (ec == kvrgw::KVRGW_ERR_BUCKET_ALREADY_EXISTS ? " (clean up before load)" : "");
       }
       ec = ctx.svc->put_bucket_versioning(ctx.tenant, ctx.bucket(b), kvrgw::VERSIONING_ENABLED);
       if (ec != kvrgw::KVRGW_ERR_OK) {
-        return "put_bucket_versioning " + ctx.bucket(b) + ": " + kvrgw::kvrgw_strerror(ec);
+        return "put_bucket_versioning " + ctx.bucket(b) + ": " + describe_error(ec);
       }
     }
     return {};

@@ -512,7 +512,8 @@ type ProgressReport struct {
 	WindowStats          []*OpStats             `protobuf:"bytes,4,rep,name=window_stats,json=windowStats,proto3" json:"window_stats,omitempty"`
 	CumulativeStats      []*OpStats             `protobuf:"bytes,5,rep,name=cumulative_stats,json=cumulativeStats,proto3" json:"cumulative_stats,omitempty"` // full snapshot, not delta
 	CumulativeAsOfUnixNs int64                  `protobuf:"varint,6,opt,name=cumulative_as_of_unix_ns,json=cumulativeAsOfUnixNs,proto3" json:"cumulative_as_of_unix_ns,omitempty"`
-	ServerStats          *ServerStats           `protobuf:"bytes,7,opt,name=server_stats,json=serverStats,proto3" json:"server_stats,omitempty"` // cumulative snapshot of in-process kvrgw stats
+	ServerStats          *ServerStats           `protobuf:"bytes,7,opt,name=server_stats,json=serverStats,proto3" json:"server_stats,omitempty"`                                                                                             // cumulative snapshot of in-process kvrgw stats
+	ErrorDescriptions    map[string]string      `protobuf:"bytes,8,rep,name=error_descriptions,json=errorDescriptions,proto3" json:"error_descriptions,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // error code name -> human-readable text
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -592,6 +593,13 @@ func (x *ProgressReport) GetCumulativeAsOfUnixNs() int64 {
 func (x *ProgressReport) GetServerStats() *ServerStats {
 	if x != nil {
 		return x.ServerStats
+	}
+	return nil
+}
+
+func (x *ProgressReport) GetErrorDescriptions() map[string]string {
+	if x != nil {
+		return x.ErrorDescriptions
 	}
 	return nil
 }
@@ -812,10 +820,11 @@ type OpStats struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	OperationType string                 `protobuf:"bytes,1,opt,name=operation_type,json=operationType,proto3" json:"operation_type,omitempty"` // "put_object","list_objects","delete_multi",
 	// plus counter-style types: "keys_listed","keys_deleted"
-	Count         uint64     `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"` // successes; latency covers only these
-	Errors        uint64     `protobuf:"varint,3,opt,name=errors,proto3" json:"errors,omitempty"`
-	SumMicros     uint64     `protobuf:"varint,4,opt,name=sum_micros,json=sumMicros,proto3" json:"sum_micros,omitempty"`
-	Latency       *Histogram `protobuf:"bytes,5,opt,name=latency,proto3" json:"latency,omitempty"` // empty for counter-style types (count = units)
+	Count         uint64            `protobuf:"varint,2,opt,name=count,proto3" json:"count,omitempty"` // successes; latency covers only these
+	Errors        uint64            `protobuf:"varint,3,opt,name=errors,proto3" json:"errors,omitempty"`
+	SumMicros     uint64            `protobuf:"varint,4,opt,name=sum_micros,json=sumMicros,proto3" json:"sum_micros,omitempty"`
+	Latency       *Histogram        `protobuf:"bytes,5,opt,name=latency,proto3" json:"latency,omitempty"`                                                                                                    // empty for counter-style types (count = units)
+	ErrorCodes    map[string]uint64 `protobuf:"bytes,6,rep,name=error_codes,json=errorCodes,proto3" json:"error_codes,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"` // errors by code name (sum == errors, same window/cumulative scope)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -881,6 +890,13 @@ func (x *OpStats) GetSumMicros() uint64 {
 func (x *OpStats) GetLatency() *Histogram {
 	if x != nil {
 		return x.Latency
+	}
+	return nil
+}
+
+func (x *OpStats) GetErrorCodes() map[string]uint64 {
+	if x != nil {
+		return x.ErrorCodes
 	}
 	return nil
 }
@@ -1153,7 +1169,7 @@ const file_worker_proto_rawDesc = "" +
 	"\n" +
 	"RunSummary\x12!\n" +
 	"\fworker_index\x18\x01 \x01(\x05R\vworkerIndex\x12#\n" +
-	"\rthread_counts\x18\x02 \x03(\x04R\fthreadCounts\"\xdc\x02\n" +
+	"\rthread_counts\x18\x02 \x03(\x04R\fthreadCounts\"\x81\x04\n" +
 	"\x0eProgressReport\x12!\n" +
 	"\fworker_index\x18\x01 \x01(\x05R\vworkerIndex\x12\x16\n" +
 	"\x06window\x18\x02 \x01(\x03R\x06window\x12,\n" +
@@ -1161,7 +1177,11 @@ const file_worker_proto_rawDesc = "" +
 	"\fwindow_stats\x18\x04 \x03(\v2\x10.perf.v1.OpStatsR\vwindowStats\x12;\n" +
 	"\x10cumulative_stats\x18\x05 \x03(\v2\x10.perf.v1.OpStatsR\x0fcumulativeStats\x126\n" +
 	"\x18cumulative_as_of_unix_ns\x18\x06 \x01(\x03R\x14cumulativeAsOfUnixNs\x127\n" +
-	"\fserver_stats\x18\a \x01(\v2\x14.perf.v1.ServerStatsR\vserverStats\"\xe1\x03\n" +
+	"\fserver_stats\x18\a \x01(\v2\x14.perf.v1.ServerStatsR\vserverStats\x12]\n" +
+	"\x12error_descriptions\x18\b \x03(\v2..perf.v1.ProgressReport.ErrorDescriptionsEntryR\x11errorDescriptions\x1aD\n" +
+	"\x16ErrorDescriptionsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xe1\x03\n" +
 	"\vServerStats\x12(\n" +
 	"\x03ops\x18\x01 \x03(\v2\x16.perf.v1.ServerOpStatsR\x03ops\x12#\n" +
 	"\rbatch_commits\x18\x02 \x01(\x04R\fbatchCommits\x12#\n" +
@@ -1185,14 +1205,19 @@ const file_worker_proto_rawDesc = "" +
 	"fdb_get_us\x18\x05 \x01(\x04R\bfdbGetUs\x12\"\n" +
 	"\rfdb_commit_us\x18\x06 \x01(\x04R\vfdbCommitUs\x12\x1e\n" +
 	"\vfdb_scan_us\x18\a \x01(\x04R\tfdbScanUs\x12\x17\n" +
-	"\adisk_us\x18\b \x01(\x04R\x06diskUs\"\xab\x01\n" +
+	"\adisk_us\x18\b \x01(\x04R\x06diskUs\"\xad\x02\n" +
 	"\aOpStats\x12%\n" +
 	"\x0eoperation_type\x18\x01 \x01(\tR\roperationType\x12\x14\n" +
 	"\x05count\x18\x02 \x01(\x04R\x05count\x12\x16\n" +
 	"\x06errors\x18\x03 \x01(\x04R\x06errors\x12\x1d\n" +
 	"\n" +
 	"sum_micros\x18\x04 \x01(\x04R\tsumMicros\x12,\n" +
-	"\alatency\x18\x05 \x01(\v2\x12.perf.v1.HistogramR\alatency\"Q\n" +
+	"\alatency\x18\x05 \x01(\v2\x12.perf.v1.HistogramR\alatency\x12A\n" +
+	"\verror_codes\x18\x06 \x03(\v2 .perf.v1.OpStats.ErrorCodesEntryR\n" +
+	"errorCodes\x1a=\n" +
+	"\x0fErrorCodesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"Q\n" +
 	"\tHistogram\x12!\n" +
 	"\fbucket_index\x18\x01 \x03(\rR\vbucketIndex\x12!\n" +
 	"\fbucket_count\x18\x02 \x03(\x04R\vbucketCount\"\x9c\x02\n" +
@@ -1233,7 +1258,7 @@ func file_worker_proto_rawDescGZIP() []byte {
 }
 
 var file_worker_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_worker_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_worker_proto_goTypes = []any{
 	(PhaseEvent_State)(0),  // 0: perf.v1.PhaseEvent.State
 	(*InitRequest)(nil),    // 1: perf.v1.InitRequest
@@ -1250,7 +1275,9 @@ var file_worker_proto_goTypes = []any{
 	(*Histogram)(nil),      // 12: perf.v1.Histogram
 	(*VerifyResult)(nil),   // 13: perf.v1.VerifyResult
 	(*BucketVerify)(nil),   // 14: perf.v1.BucketVerify
-	nil,                    // 15: perf.v1.ServerStats.ErrorsEntry
+	nil,                    // 15: perf.v1.ProgressReport.ErrorDescriptionsEntry
+	nil,                    // 16: perf.v1.ServerStats.ErrorsEntry
+	nil,                    // 17: perf.v1.OpStats.ErrorCodesEntry
 }
 var file_worker_proto_depIdxs = []int32{
 	3,  // 0: perf.v1.RunControl.cancel:type_name -> perf.v1.Cancel
@@ -1261,23 +1288,25 @@ var file_worker_proto_depIdxs = []int32{
 	11, // 5: perf.v1.ProgressReport.window_stats:type_name -> perf.v1.OpStats
 	11, // 6: perf.v1.ProgressReport.cumulative_stats:type_name -> perf.v1.OpStats
 	9,  // 7: perf.v1.ProgressReport.server_stats:type_name -> perf.v1.ServerStats
-	10, // 8: perf.v1.ServerStats.ops:type_name -> perf.v1.ServerOpStats
-	15, // 9: perf.v1.ServerStats.errors:type_name -> perf.v1.ServerStats.ErrorsEntry
-	12, // 10: perf.v1.OpStats.latency:type_name -> perf.v1.Histogram
-	14, // 11: perf.v1.VerifyResult.buckets:type_name -> perf.v1.BucketVerify
-	1,  // 12: perf.v1.Worker.Init:input_type -> perf.v1.InitRequest
-	2,  // 13: perf.v1.Worker.RunBenchmark:input_type -> perf.v1.RunControl
-	4,  // 14: perf.v1.Worker.Verify:input_type -> perf.v1.VerifyRequest
-	5,  // 15: perf.v1.Worker.Cleanup:input_type -> perf.v1.CleanupRequest
-	6,  // 16: perf.v1.Worker.Init:output_type -> perf.v1.PhaseEvent
-	6,  // 17: perf.v1.Worker.RunBenchmark:output_type -> perf.v1.PhaseEvent
-	6,  // 18: perf.v1.Worker.Verify:output_type -> perf.v1.PhaseEvent
-	6,  // 19: perf.v1.Worker.Cleanup:output_type -> perf.v1.PhaseEvent
-	16, // [16:20] is the sub-list for method output_type
-	12, // [12:16] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	15, // 8: perf.v1.ProgressReport.error_descriptions:type_name -> perf.v1.ProgressReport.ErrorDescriptionsEntry
+	10, // 9: perf.v1.ServerStats.ops:type_name -> perf.v1.ServerOpStats
+	16, // 10: perf.v1.ServerStats.errors:type_name -> perf.v1.ServerStats.ErrorsEntry
+	12, // 11: perf.v1.OpStats.latency:type_name -> perf.v1.Histogram
+	17, // 12: perf.v1.OpStats.error_codes:type_name -> perf.v1.OpStats.ErrorCodesEntry
+	14, // 13: perf.v1.VerifyResult.buckets:type_name -> perf.v1.BucketVerify
+	1,  // 14: perf.v1.Worker.Init:input_type -> perf.v1.InitRequest
+	2,  // 15: perf.v1.Worker.RunBenchmark:input_type -> perf.v1.RunControl
+	4,  // 16: perf.v1.Worker.Verify:input_type -> perf.v1.VerifyRequest
+	5,  // 17: perf.v1.Worker.Cleanup:input_type -> perf.v1.CleanupRequest
+	6,  // 18: perf.v1.Worker.Init:output_type -> perf.v1.PhaseEvent
+	6,  // 19: perf.v1.Worker.RunBenchmark:output_type -> perf.v1.PhaseEvent
+	6,  // 20: perf.v1.Worker.Verify:output_type -> perf.v1.PhaseEvent
+	6,  // 21: perf.v1.Worker.Cleanup:output_type -> perf.v1.PhaseEvent
+	18, // [18:22] is the sub-list for method output_type
+	14, // [14:18] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_worker_proto_init() }
@@ -1294,7 +1323,7 @@ func file_worker_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_worker_proto_rawDesc), len(file_worker_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   15,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

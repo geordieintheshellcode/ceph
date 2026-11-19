@@ -36,6 +36,12 @@ func (v *invocation) runBenchmark(sigCtx, mctx context.Context, benchStarted cha
 		return nil, false
 	}
 	defer v.serverCSV.Close()
+	if v.errorsCSV, err = v.dir.OpenCSV("errors.csv", results.ErrorsHeader...); err != nil {
+		v.fail("errors.csv: %v", err)
+		return nil, false
+	}
+	defer v.errorsCSV.Close()
+	v.errDescs = map[string]string{}
 	v.totals = map[string]*stats.Metric{}
 	v.cum = map[string][2]uint64{}
 	v.seenOps = map[string]bool{}
@@ -121,6 +127,9 @@ func (v *invocation) runBenchmark(sigCtx, mctx context.Context, benchStarted cha
 				}
 				if ev.Progress != nil {
 					aggMu.Lock()
+					for k, t := range ev.Progress.ErrorDescriptions {
+						v.errDescs[k] = t
+					}
 					wins := agg.Add(i, ev.Progress)
 					v.handleWindows(wins)
 					aggMu.Unlock()
@@ -187,6 +196,13 @@ func (v *invocation) handleWindows(wins []*stats.Window) {
 			c[1] += m.Errors
 			v.cum[op] = c
 			rate := float64(m.Count) / secs
+			errNote := ""
+			if m.Errors > 0 && !stats.IsCounter(op) {
+				for _, code := range sortedKeys(m.ErrorCodes) {
+					v.errorsCSV.Row(results.I(ts), results.I(w.Index), op, code, results.U(m.ErrorCodes[code]))
+				}
+				errNote = " [" + stats.FormatErrorCodes(m.ErrorCodes) + "]"
+			}
 			if stats.IsCounter(op) {
 				v.metricsCSV.Row(results.I(ts), results.I(w.Index), op, results.U(m.Count), results.U(m.Errors),
 					results.F(rate), "", "", "", "", "", "", results.U(c[0]), results.U(c[1]))
@@ -205,8 +221,8 @@ func (v *invocation) handleWindows(wins []*stats.Window) {
 			for k := range idx {
 				v.histCSV.Row(results.I(w.Index), op, results.I(int64(idx[k])), results.U(cnt[k]))
 			}
-			parts = append(parts, fmt.Sprintf("%s %s ops/s p50=%s p99=%s err=%d", op, human(rate),
-				fmtUs(m.Hist.Quantile(0.5)), fmtUs(m.Hist.Quantile(0.99)), m.Errors))
+			parts = append(parts, fmt.Sprintf("%s %s ops/s p50=%s p99=%s err=%d%s", op, human(rate),
+				fmtUs(m.Hist.Quantile(0.5)), fmtUs(m.Hist.Quantile(0.99)), m.Errors, errNote))
 		}
 		for _, name := range sortedKeys(w.Server) {
 			v.serverCSV.Row(results.I(ts), results.I(w.Index), name, results.U(w.Server[name]))
@@ -230,12 +246,5 @@ func human(f float64) string {
 	return string(out)
 }
 
-func fmtUs(us uint64) string {
-	switch {
-	case us >= 1_000_000:
-		return fmt.Sprintf("%.2fs", float64(us)/1e6)
-	case us >= 1000:
-		return fmt.Sprintf("%.1fms", float64(us)/1e3)
-	}
-	return fmt.Sprintf("%dus", us)
-}
+// fmtUs renders a microsecond latency in milliseconds to 3 significant figures.
+func fmtUs(us uint64) string { return stats.Ms(float64(us)) }

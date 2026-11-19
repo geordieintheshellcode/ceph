@@ -73,6 +73,8 @@ type invocation struct {
 	windows                        int
 	lastServer                     map[string]uint64
 	verifySum                      *results.VerifySummary
+	errorsCSV                      *results.CSV
+	errDescs                       map[string]string
 	workerSums                     []*pb.RunSummary
 	benchEndMs                     int64
 }

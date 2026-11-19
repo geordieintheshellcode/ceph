@@ -18,6 +18,8 @@ type OpTotals struct {
 	P99Us     uint64  `json:"p99_us,omitempty"`
 	P999Us    uint64  `json:"p999_us,omitempty"`
 	MaxUs     uint64  `json:"max_us,omitempty"`
+	// ErrorCodes breaks Errors down by library error code name.
+	ErrorCodes map[string]uint64 `json:"error_codes,omitempty"`
 }
 
 type WorkerSummary struct {
@@ -61,9 +63,11 @@ type Summary struct {
 	ServerTotals  map[string]uint64   `json:"server_stats_final,omitempty"`
 	Verify        *VerifySummary      `json:"verify,omitempty"`
 	OpErrors      uint64              `json:"op_errors"`
-	Failed        bool                `json:"failed"`
-	Failures      []string            `json:"failures,omitempty"`
-	ExitStatus    int                 `json:"exit_status"`
+	// ErrorDescriptions maps error code names to human-readable text.
+	ErrorDescriptions map[string]string `json:"error_descriptions,omitempty"`
+	Failed            bool              `json:"failed"`
+	Failures          []string          `json:"failures,omitempty"`
+	ExitStatus        int               `json:"exit_status"`
 }
 
 func ReadSummary(path string) (*Summary, error) {

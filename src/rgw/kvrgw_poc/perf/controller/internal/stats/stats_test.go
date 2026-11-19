@@ -70,6 +70,21 @@ func TestMergeAndQuantiles(t *testing.T) {
 	}
 }
 
+func TestErrorCodesMergeAndFormat(t *testing.T) {
+	a := FromProto(&pb.OpStats{Count: 1, Errors: 3, ErrorCodes: map[string]uint64{"KVRGW_ERR_TXN_CONFLICT": 2, "KVRGW_ERR_NO_SUCH_BUCKET": 1}})
+	b := FromProto(&pb.OpStats{Errors: 2, ErrorCodes: map[string]uint64{"KVRGW_ERR_TXN_CONFLICT": 2}})
+	a.Merge(&b)
+	if a.Errors != 5 || a.ErrorCodes["KVRGW_ERR_TXN_CONFLICT"] != 4 || a.ErrorCodes["KVRGW_ERR_NO_SUCH_BUCKET"] != 1 {
+		t.Fatalf("%+v", a)
+	}
+	if got := FormatErrorCodes(a.ErrorCodes); got != "TXN_CONFLICT x4, NO_SUCH_BUCKET x1" {
+		t.Fatalf("%q", got)
+	}
+	if FormatErrorCodes(nil) != "" {
+		t.Fatal("empty")
+	}
+}
+
 func TestSummarize(t *testing.T) {
 	s := Summarize([]float64{10, 10, 10, 10, 10, 10, 10, 10, 10, 20}, 10)
 	if s.Median != 10 || s.Min != 10 || s.Max != 20 || math.Abs(s.Avg-11) > 1e-9 {
@@ -121,5 +136,19 @@ func TestAggregatorAcrossWorkers(t *testing.T) {
 	}
 	if got = a.Finish(0); len(got) != 0 {
 		t.Fatal("nothing left")
+	}
+}
+
+func TestMsFormatting(t *testing.T) {
+	for in, want := range map[float64]string{
+		0: "0", 5772: "5.77", 10070: "10.1", 9816: "9.82", 234: "0.234", 23.4: "0.0234",
+		123456: "123", 1234567: "1,235", 999: "0.999", 100000: "100",
+	} {
+		if got := MsNum(in); got != want {
+			t.Errorf("MsNum(%v)=%q want %q", in, got, want)
+		}
+	}
+	if Ms(5772) != "5.77ms" {
+		t.Fatal(Ms(5772))
 	}
 }
