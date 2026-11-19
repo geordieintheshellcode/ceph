@@ -12,7 +12,8 @@ RUN test "$(uname -m)" = x86_64 \
 
 RUN dnf install -y \
         ca-certificates cmake cpio curl-minimal gcc-toolset-14-gcc-c++ git make \
-        nlohmann-json-devel openssl-devel pkgconf-pkg-config rpm-build \
+        grpc-devel grpc-plugins nlohmann-json-devel openssl-devel \
+        pkgconf-pkg-config protobuf-devel protobuf-compiler rpm-build \
         yaml-cpp-devel \
     && dnf clean all
 

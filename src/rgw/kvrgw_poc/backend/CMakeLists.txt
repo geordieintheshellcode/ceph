@@ -439,3 +439,10 @@ add_test(NAME err_insertion_test COMMAND err_insertion_test)
 add_test(NAME batch_mixed_test COMMAND batch_mixed_test)
 add_test(NAME d_write_test COMMAND d_write_test)
 add_test(NAME put_condition_test COMMAND put_condition_test)
+
+# Optional gRPC perf harness (perf/): worker + Go controller. Off by default so the
+# default build does not need gRPC/protobuf.
+option(KVRGW_BUILD_PERF_HARNESS "Build gRPC perf controller/worker" OFF)
+if(KVRGW_BUILD_PERF_HARNESS)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/../perf ${CMAKE_BINARY_DIR}/perf)
+endif()

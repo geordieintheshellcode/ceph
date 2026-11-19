@@ -25,9 +25,20 @@ trap 'rm -rf "$STAGE"' EXIT
 cp "$POC/build/kv-rgw-frontend" "$POC/build/kv-rgw-backend" "$POC/build/libkvrgw.so" "$STAGE/"
 cp "$FDB_LIB" "$STAGE/libfdb_c.so"
 cp "$POC/backend/kvrgw.yaml" "$STAGE/"
+
+# Optional perf harness: included only if it was built (-DKVRGW_BUILD_PERF_HARNESS=ON).
+mkdir "$STAGE/perf-bin"
+WITH_PERF=0
+FDBCLI="${FDBCLI:-$POC/third_party/fdb/usr/bin/fdbcli}"
+if [[ -f "$POC/build/kvrgw-perf" && -f "$POC/build/perf/kvrgw-perf-worker" ]]; then
+  [[ -f "$FDBCLI" ]] || { echo "missing $FDBCLI (needed by the perf controller)" >&2; exit 1; }
+  cp "$POC/build/kvrgw-perf" "$POC/build/perf/kvrgw-perf-worker" "$FDBCLI" "$STAGE/perf-bin/"
+  WITH_PERF=1
+  echo "including perf harness in the image"
+fi
 cp -r "$POC/iam" "$STAGE/iam"
 
-"$DOCKER" build -t "$IMAGE" -f "$POC/Dockerfile.run" "$STAGE"
+"$DOCKER" build --build-arg WITH_PERF="$WITH_PERF" -t "$IMAGE" -f "$POC/Dockerfile.run" "$STAGE"
 
 mkdir -p "$OUT"
 "$DOCKER" save "$IMAGE" | gzip > "$OUT/kvrgw-gw.tar.gz"

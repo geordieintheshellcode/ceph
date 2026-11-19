@@ -1,6 +1,6 @@
 # kvrgw perf harness — specification
 
-Status: design agreed, not yet implemented. This document is self-contained: an
+Status: implemented (see README.md for build/run notes and deliberate deviations). This document is self-contained: an
 implementer should not need any other context. Paths are relative to
 `src/rgw/kvrgw_poc/` unless stated otherwise.
 
@@ -209,7 +209,7 @@ Inserts brand-new keys never present in `load` or any earlier run.
 - Verify: per key (point lookups; keys are known so no bucket scan or bitset is
   needed; each thread checks its own window), call
   `list_object_versions(prefix=key)` (page through if needed) and count versions with `key == exact` and
-  `last_modified_unix >= run_start_unix_s`. This isolates versions written by
+  `last_modified_unix >= run_start_unix_s` (the worker uses the second of the synchronised benchmark start from `RunControl.run_start_unix_ns`, which is never earlier and avoids counting a previous back-to-back invocation's writes). This isolates versions written by
   this run without snapshotting prior counts (timestamp resolution is seconds; two
   runs overlapping in the same second is accepted as out of scope). Count must
   equal expected. Mismatches are reported as verify errors with key and

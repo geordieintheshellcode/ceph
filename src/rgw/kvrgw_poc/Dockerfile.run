@@ -9,7 +9,15 @@ RUN dnf install -y epel-release \
     && dnf install -y yaml-cpp openssl-libs \
     && dnf clean all
 
+# Optional perf harness (kvrgw-perf controller + kvrgw-perf-worker + fdbcli). package_image.sh
+# stages them into perf-bin/ and sets WITH_PERF=1 only when they were built
+# (cmake -DKVRGW_BUILD_PERF_HARNESS=ON); otherwise perf-bin/ is empty and nothing changes.
+ARG WITH_PERF=0
+RUN if [ "$WITH_PERF" = 1 ]; then dnf install -y epel-release && dnf install -y --enablerepo=crb grpc-cpp \
+    && dnf clean all; fi
+
 COPY kv-rgw-frontend kv-rgw-backend libkvrgw.so libfdb_c.so /opt/kvrgw/
+COPY perf-bin/ /opt/kvrgw/
 COPY kvrgw.yaml /etc/kvrgw/kvrgw.yaml
 COPY iam/ /etc/kvrgw/iam/
 
