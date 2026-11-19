@@ -73,28 +73,20 @@ run-list-objects:
 
 # Repeatedly overwrites the first num_objects_to_overwrite keys of each thread's range.
 run-put-object-overwrite:
-  worker_count: 1
-  threads_per_worker: 1
-  verify_threads: 4
+  #ops: 1000000
   ops: 0
   duration: 30s
   num_objects_to_overwrite: 100000
 
 # As above, and verifies the number of versions written per key. Requires versioned buckets.
 run-put-object-overwrite-versioned:
-  worker_count: 1
-  threads_per_worker: 1
-  verify_threads: 4
-  ops: 0
+  #ops: 1000000
   duration: 30s
   num_objects_to_overwrite: 100000
 
 # DESTRUCTIVE: deletes loaded objects in batches (prompts unless --yes).
 run-delete-multi:
-  worker_count: 1
-  threads_per_worker: 1
-  verify_threads: 4
-  ops: 0
+  #ops: 1000000
   duration: 30s
   page_size: 1000            # max keys per delete_multi call
   single_thread_mode: false  # true: one worker, one thread, bucket 0 only
