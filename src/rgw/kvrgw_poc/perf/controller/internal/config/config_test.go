@@ -1,6 +1,13 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"reflect"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
 
 const sample = `
 base:
@@ -128,4 +135,75 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// The shipped file may carry tuned values, but it must parse strictly, validate for every
+// command, and list every config key explicitly in `base` (so all settings are discoverable).
+func TestShippedConfigIsComplete(t *testing.T) {
+	f, err := LoadFile("../../../kvrgw-perf.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var base map[string]any
+	if err := yaml.Unmarshal(f.sections["base"], &base); err != nil {
+		t.Fatal(err)
+	}
+	rt := reflect.TypeOf(Config{})
+	for i := 0; i < rt.NumField(); i++ {
+		key := strings.Split(rt.Field(i).Tag.Get("yaml"), ",")[0]
+		if key == "-" || key == "" || key == "ops" || key == "duration" ||
+			key == "page_size" || key == "single_thread_mode" || key == "num_objects_to_overwrite" {
+			continue // command-specific keys live in the command sections
+		}
+		if _, ok := base[key]; !ok {
+			t.Errorf("base section does not list %q", key)
+		}
+	}
+	for _, cmd := range Commands {
+		c, err := Resolve(f, cmd)
+		if err != nil {
+			t.Fatalf("%s: %v", cmd, err)
+		}
+		if cmd != "load" {
+			if c.Ops != 0 || c.Duration == "" {
+				t.Fatalf("%s: want a default duration and no ops, got ops=%d duration=%q", cmd, c.Ops, c.Duration)
+			}
+			c.Ops, c.Duration = 1, ""
+		}
+		if err := c.Validate(cmd); err != nil {
+			t.Errorf("%s: %v", cmd, err)
+		}
+	}
+}
+
+func TestKvrgwYAML(t *testing.T) {
+	c := Defaults()
+	c.Kvrgw.BatchSize = 9
+	p := t.TempDir() + "/kvrgw.yaml"
+	if err := c.WriteKvrgwYAML(p); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(p)
+	for _, want := range []string{"tier:", "max_inline: 256", "max_kv_store: 4096", "batch_size: 9", "batch_threads: 8"} {
+		if !contains(string(b), want) {
+			t.Errorf("missing %q in\n%s", want, b)
+		}
+	}
+	if env := c.KvrgwEnv(); env[0] != "KVRGW_BATCH_SIZE=9" || len(env) != 3 {
+		t.Fatalf("%v", env)
+	}
+	ov := NewOverrides()
+	ov.vals["batch_size"] = "2"
+	ov.vals["max_inline"] = "512"
+	ov.Apply(&c)
+	if c.Kvrgw.BatchSize != 2 || c.Kvrgw.MaxInline != 512 {
+		t.Fatalf("%+v", c.Kvrgw)
+	}
+	if _, err := ParseFile([]byte("kvrgw: {}")); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := ParseFile([]byte("kvrgw:\n  bogus: 1\n"))
+	if _, err := Resolve(f, "load"); err == nil {
+		t.Fatal("unknown kvrgw key must fail")
+	}
 }

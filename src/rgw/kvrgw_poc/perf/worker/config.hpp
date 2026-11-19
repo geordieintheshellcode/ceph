@@ -2,7 +2,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <string>
 
 namespace perfw {
@@ -19,7 +18,6 @@ struct Config {
   int verify_threads = 4;
   std::string tenant_name = "kv-poc";
   int64_t report_interval_ms = 1000;
-  std::optional<int> batch_size, batch_timeout_us, batch_threads;
   // run-* only; exactly one of ops/duration_ms is > 0.
   uint64_t ops = 0;
   int64_t duration_ms = 0;

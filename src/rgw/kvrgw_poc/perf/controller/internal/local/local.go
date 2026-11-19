@@ -37,7 +37,11 @@ type Local struct {
 	BasePort int
 	RunDir   string
 	CPUs     string // optional pool, e.g. "0-15" or "0,2,4-7"
-	Grace    time.Duration
+	// KvrgwConfig is the synthesized runtime config (KVRGW_CONFIG_FILE) and ExtraEnv extra
+	// variables (e.g. KVRGW_BATCH_*) for every worker.
+	KvrgwConfig string
+	ExtraEnv    []string
+	Grace       time.Duration
 
 	mu       sync.Mutex
 	cmds     []*exec.Cmd
@@ -138,7 +142,11 @@ func (l *Local) Start(ctx context.Context, n int) ([]Worker, error) {
 		}
 		cmd := exec.Command(name, args...)
 		sock := filepath.Join(os.TempDir(), fmt.Sprintf("kvrgw-perf-%d-%d.sock", os.Getpid(), i))
-		cmd.Env = append(os.Environ(),
+		cmd.Env = append(os.Environ(), l.ExtraEnv...)
+		if l.KvrgwConfig != "" {
+			cmd.Env = append(cmd.Env, "KVRGW_CONFIG_FILE="+l.KvrgwConfig)
+		}
+		cmd.Env = append(cmd.Env,
 			"KVRGW_INSTANCE_ID="+strconv.Itoa(i),
 			"KVRGW_ADMIN_SOCKET="+sock)
 		lf, err := os.Create(filepath.Join(l.RunDir, fmt.Sprintf("worker-%d.log", i)))

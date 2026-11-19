@@ -32,7 +32,7 @@ WITH_PERF=0
 FDBCLI="${FDBCLI:-$POC/third_party/fdb/usr/bin/fdbcli}"
 if [[ -f "$POC/build/kvrgw-perf" && -f "$POC/build/perf/kvrgw-perf-worker" ]]; then
   [[ -f "$FDBCLI" ]] || { echo "missing $FDBCLI (needed by the perf controller)" >&2; exit 1; }
-  cp "$POC/build/kvrgw-perf" "$POC/build/perf/kvrgw-perf-worker" "$FDBCLI" "$STAGE/perf-bin/"
+  cp "$POC/build/kvrgw-perf" "$POC/build/perf/kvrgw-perf-worker" "$FDBCLI" "$POC/perf/kvrgw-perf.yaml" "$STAGE/perf-bin/"
   WITH_PERF=1
   echo "including perf harness in the image"
 fi

@@ -97,18 +97,7 @@ std::string WorkerService::do_init(const perf::v1::InitRequest &req)
   ctx->svc = &rt_.service();
   auto &svc = *ctx->svc;
 
-  // Optional batch-queue overrides (same procedure as perf_driver's set-batch).
   const auto &cfg = ctx->cfg;
-  if (cfg.batch_size || cfg.batch_timeout_us || cfg.batch_threads) {
-    auto tc = svc.tier_config_state().active_copy();
-    if (cfg.batch_size) tc.batch_size = *cfg.batch_size;
-    if (cfg.batch_timeout_us) tc.batch_timeout_us = *cfg.batch_timeout_us;
-    if (cfg.batch_threads) tc.batch_threads = *cfg.batch_threads;
-    svc.tier_config_state().try_stage(tc);
-    svc.tier_config_state().maybe_apply_pending();
-    svc.batch_queue().stop();
-    if (tc.batch_size > 1) svc.batch_queue().start(tc.batch_threads);
-  }
 
   // Tenant: worker 0 creates it if missing; the others wait for it to appear.
   {

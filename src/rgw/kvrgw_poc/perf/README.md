@@ -39,22 +39,30 @@ The generated Go stubs in `controller/gen/perf/v1/` are checked in. After editin
 ## Run
 
 Bring FDB up yourself; the harness only reads from a running cluster. Set
-`FDB_CLUSTER_FILE`, `KVRGW_CONFIG_FILE` (kvrgw.yaml) and `KVRGW_DATA` as for the gateway.
+`FDB_CLUSTER_FILE` and `KVRGW_DATA` as for the gateway.
 
-    kvrgw-perf --config perf.yaml load
-    kvrgw-perf --config perf.yaml run-put-object --duration 60s
-    kvrgw-perf --config perf.yaml run-list-objects --duration 30s
+    kvrgw-perf load
+    kvrgw-perf run-put-object --duration 60s
+    kvrgw-perf run-list-objects --duration 30s
     kvrgw-perf report perf-results/<dir> --warmup 10s
 
-Config is `base` <- per-command section <- CLI flags; keys are snake_case and every key is
-also a `--kebab-case` flag. See SPEC.md section 5.1 for the file layout and key table.
+All settings live in one file, [kvrgw-perf.yaml](kvrgw-perf.yaml), which lists every default
+explicitly. It is found via `--config`, else `./kvrgw-perf.yaml`, else next to the
+`kvrgw-perf` binary (the build copies it there), else `/opt/kvrgw/kvrgw-perf.yaml`.
+Sections: `kvrgw` (the runtime tier/batch settings), `base`, and one per command.
+Resolution is built-in default <- `base` <- command section <- CLI flag; keys are snake_case
+and every key is also a `--kebab-case` flag (`--batch-size`, `--max-inline`, ...).
+The controller synthesizes `<run-dir>/kvrgw.yaml` from the `kvrgw` section and points the
+workers at it (`KVRGW_CONFIG_FILE`), so `backend/kvrgw.yaml` is not used. The runtime's yaml
+loader ignores `batch_*`, so the controller also exports them as `KVRGW_BATCH_*`.
+See SPEC.md section 5.1 for the key table.
 Each invocation is independent: `load` once, then any number of `run-*`, using the same
 layout config. `run-*` commands take exactly one of `--ops N` / `--duration D`.
 
 Local mode (the only mode in v1) spawns `worker_count` workers on `127.0.0.1:<base-port+i>`;
 `--cpus 0-15` splits a CPU pool across them with `taskset`.
 
-Results directory: `config.resolved.json events.csv metrics.csv hist.csv server_stats.csv
+Results directory: `config.resolved.json kvrgw.yaml events.csv metrics.csv hist.csv server_stats.csv
 cpu.csv fdb_cluster.csv fdb_process.csv fdb_status_start.json summary.json controller.log
 worker-<i>.log` (spec section 8.1). FDB files are present only if `fdbcli` works.
 
@@ -76,8 +84,8 @@ Exit codes: 0 success, 1 benchmark/verify failure or worker error, 2 usage.
 - `report_interval_ms: 0` disables periodic windows; workers then send one report covering
   the whole run.
 - Server-side stats are recorded by the caller in this code base (as `perf_driver.cpp`
-  does), so the worker wraps each call in `ScopedRequestLatency`. Objects larger than
-  `max_inline` are not batched, so `batch.*` stays 0 for the default 8 KiB payload.
+  does), so the worker wraps each call in `ScopedRequestLatency`. In the runs I checked, only
+  8 KiB objects (above `max_kv_store`) showed batch commits; 100 B and 1 KiB objects showed none.
 - The library never calls its FDB get/commit/scan timing hooks, so the report's server-side section shows only `avg_total` (and `disk` when non-zero).
-- `fdbcli_path` defaults to `/opt/foundationdb/usr/bin/fdbcli` when that file exists (the build/run containers), else `fdbcli` on `PATH`.
+- `fdbcli_path` defaults to `/opt/foundationdb/usr/bin/fdbcli`; if absent it falls back to `PATH`, then next to the binary, `/opt/kvrgw`.
 - `cpu.csv`/report show system CPU in cores-equivalent (no CPU count is recorded).

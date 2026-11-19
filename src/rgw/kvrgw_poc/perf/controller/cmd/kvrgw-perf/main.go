@@ -32,7 +32,7 @@ commands:
         [--warmup D] [--deviation N] [--per-server]
 
 global flags:
-  --config FILE          harness config (default ./kvrgw-perf.yaml if present)
+  --config FILE          harness config (default: ./kvrgw-perf.yaml, else next to the binary)
   --workers N            worker_count          --threads M   threads_per_worker
   --worker-binary PATH   kvrgw-perf-worker     --base-port P (default 9090)
   --cpus LIST            CPU pool to pin workers to, e.g. 0-15
@@ -106,9 +106,7 @@ func run(args []string) int {
 	var file *config.File
 	cfgPath := g.config
 	if cfgPath == "" {
-		if _, err := os.Stat("kvrgw-perf.yaml"); err == nil {
-			cfgPath = "kvrgw-perf.yaml"
-		}
+		cfgPath = findConfig()
 	}
 	if cfgPath != "" {
 		var err error
@@ -155,7 +153,14 @@ func run(args []string) int {
 		return 1
 	}
 	absRun, _ := filepath.Abs(runDir)
-	launcher := &local.Local{Binary: bin, BasePort: g.basePort, RunDir: absRun, CPUs: g.cpus}
+	// The runtime reads its own kvrgw.yaml: synthesize it from the `kvrgw:` section.
+	kvrgwYAML := filepath.Join(absRun, "kvrgw.yaml")
+	if err := cfg.WriteKvrgwYAML(kvrgwYAML); err != nil {
+		fmt.Fprintln(os.Stderr, "kvrgw.yaml:", err)
+		return 1
+	}
+	launcher := &local.Local{Binary: bin, BasePort: g.basePort, RunDir: absRun, CPUs: g.cpus,
+		KvrgwConfig: kvrgwYAML, ExtraEnv: cfg.KvrgwEnv()}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -163,12 +168,31 @@ func run(args []string) int {
 		RunDir: absRun, NoVerify: g.noVerify, Launcher: launcher})
 }
 
-// findWorker prefers a kvrgw-perf-worker next to this executable, else PATH.
+// findConfig looks for kvrgw-perf.yaml in the working directory, then next to this
+// executable (the build copies perf/kvrgw-perf.yaml there), then /opt/kvrgw (run image).
+func findConfig() string {
+	cands := []string{"kvrgw-perf.yaml"}
+	if exe, err := os.Executable(); err == nil {
+		cands = append(cands, filepath.Join(filepath.Dir(exe), "kvrgw-perf.yaml"))
+	}
+	cands = append(cands, "/opt/kvrgw/kvrgw-perf.yaml")
+	for _, c := range cands {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+// findWorker prefers a kvrgw-perf-worker next to this executable (or under perf/), else PATH.
 func findWorker() string {
 	if exe, err := os.Executable(); err == nil {
-		p := filepath.Join(filepath.Dir(exe), "kvrgw-perf-worker")
-		if _, err := os.Stat(p); err == nil {
-			return p
+		// next to the controller (run image), or in perf/ of the build tree
+		for _, p := range []string{filepath.Join(filepath.Dir(exe), "kvrgw-perf-worker"),
+			filepath.Join(filepath.Dir(exe), "perf", "kvrgw-perf-worker")} {
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
 		}
 	}
 	return "kvrgw-perf-worker"

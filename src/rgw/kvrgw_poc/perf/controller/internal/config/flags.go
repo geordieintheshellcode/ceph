@@ -23,7 +23,8 @@ var flagKeys = map[string]string{
 	"threads": "threads_per_worker", "threads-per-worker": "threads_per_worker",
 	"verify-threads": "verify_threads", "tenant-name": "tenant_name",
 	"batch-size": "batch_size", "batch-timeout-us": "batch_timeout_us",
-	"batch-threads": "batch_threads", "report-interval-ms": "report_interval_ms",
+	"batch-threads": "batch_threads", "max-inline": "max_inline", "max-kv-store": "max_kv_store",
+	"kv-store-coalescing": "kv_store_coalescing", "report-interval-ms": "report_interval_ms",
 	"fdb-cluster-file": "fdb_cluster_file", "fdbcli-path": "fdbcli_path",
 	"fdb-sample-interval-ms": "fdb_sample_interval_ms",
 	"cpu-sample-interval-ms": "cpu_sample_interval_ms",
@@ -93,9 +94,9 @@ func Set(c *Config, key, v string) error {
 		*dst = x
 		return err
 	}
-	ip := func(dst **int) error {
-		x, err := strconv.Atoi(v)
-		*dst = &x
+	u32 := func(dst *uint32) error {
+		x, err := strconv.ParseUint(v, 10, 32)
+		*dst = uint32(x)
 		return err
 	}
 	i64 := func(dst *int64) error {
@@ -128,11 +129,17 @@ func Set(c *Config, key, v string) error {
 	case "tenant_name":
 		c.TenantName = v
 	case "batch_size":
-		return ip(&c.BatchSize)
+		return i(&c.Kvrgw.BatchSize)
 	case "batch_timeout_us":
-		return ip(&c.BatchTimeoutUs)
+		return i(&c.Kvrgw.BatchTimeoutUs)
 	case "batch_threads":
-		return ip(&c.BatchThreads)
+		return i(&c.Kvrgw.BatchThreads)
+	case "max_inline":
+		return u32(&c.Kvrgw.MaxInline)
+	case "max_kv_store":
+		return u32(&c.Kvrgw.MaxKvStore)
+	case "kv_store_coalescing":
+		return b(&c.Kvrgw.KvStoreCoalescing)
 	case "report_interval_ms":
 		return i64(&c.ReportIntervalMs)
 	case "fdb_stats":

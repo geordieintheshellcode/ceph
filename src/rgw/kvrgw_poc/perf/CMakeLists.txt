@@ -62,3 +62,6 @@ add_custom_target(kvrgw-perf ALL
   COMMAND go build -o "${CMAKE_BINARY_DIR}/kvrgw-perf" ./cmd/kvrgw-perf
   WORKING_DIRECTORY "${PERF_DIR}/controller"
   COMMENT "Building Go perf controller")
+
+# Default config next to the controller binary (found automatically at run time).
+configure_file("${PERF_DIR}/kvrgw-perf.yaml" "${CMAKE_BINARY_DIR}/kvrgw-perf.yaml" COPYONLY)

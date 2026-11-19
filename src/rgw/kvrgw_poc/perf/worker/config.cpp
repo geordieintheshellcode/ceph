@@ -12,13 +12,6 @@ void get(const nlohmann::json &j, const char *k, T &dst)
     dst = it->get<T>();
   }
 }
-template <class T>
-void get_opt(const nlohmann::json &j, const char *k, std::optional<T> &dst)
-{
-  if (auto it = j.find(k); it != j.end() && !it->is_null()) {
-    dst = it->get<T>();
-  }
-}
 }  // namespace
 
 std::string parse_config(const std::string &json_text, const std::string &operation,
@@ -36,9 +29,6 @@ std::string parse_config(const std::string &json_text, const std::string &operat
     get(j, "verify_threads", c.verify_threads);
     get(j, "tenant_name", c.tenant_name);
     get(j, "report_interval_ms", c.report_interval_ms);
-    get_opt(j, "batch_size", c.batch_size);
-    get_opt(j, "batch_timeout_us", c.batch_timeout_us);
-    get_opt(j, "batch_threads", c.batch_threads);
     get(j, "ops", c.ops);
     get(j, "duration_ms", c.duration_ms);
     get(j, "page_size", c.page_size);
