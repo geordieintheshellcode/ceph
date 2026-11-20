@@ -341,8 +341,8 @@ func (d *data) print(w io.Writer, o Options) {
 	}
 
 	d.printClient(w, o, from, to)
-	d.printCPU(w, from, to)
-	d.printServer(w, from, to)
+	d.printCPU(w, o, from, to)
+	d.printServer(w, o, from, to)
 	if d.hasFDB {
 		d.printFDB(w, o, from, to)
 	}
@@ -366,10 +366,20 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 	if len(ops) == 0 {
 		return
 	}
-	fmt.Fprintln(w, "\n--- Client ops (cluster total, merged across workers) ---")
+	k := d.widen(o)
+	winLen := time.Duration(d.intervalMs) * time.Millisecond * time.Duration(k)
+	nwin := len(d.series(ops[0], from, to, k))
+	fmt.Fprintf(w, "\n--- Client ops: per-window statistics (%d windows of %s, merged across workers) ---\n", nwin, winLen)
+	fmt.Fprint(w, " Each row is measured once per window; min/max/avg/median/pXX/dev% are taken across those windows.\n\n")
+	type total struct {
+		count, errs uint64
+		meanUs      float64
+		hist        stats.Hist
+	}
+	totals := map[string]*total{}
 	for _, op := range ops {
 		var rate, mean, p50, p99, errs []float64
-		for _, sm := range d.series(op, from, to, d.widen(o)) {
+		for _, sm := range d.series(op, from, to, k) {
 			rate = append(rate, sm.rate)
 			errs = append(errs, sm.errs)
 			if sm.hasLat {
@@ -380,37 +390,73 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 		}
 		// Totals always cover every recorded window in range (including a trailing partial
 		// widened window).
-		var count, errTotal uint64
+		t := &total{}
 		wins := map[int64]bool{}
+		var sumUs float64
+		var latCount uint64
 		for _, m := range d.metrics {
 			if m.op != op || m.ts <= from || m.ts > to {
 				continue
 			}
 			wins[m.window] = true
-			count += m.count
-			errTotal += m.errors
+			t.count += m.count
+			t.errs += m.errors
+			if m.hasLat {
+				sumUs += m.meanUs * float64(m.count)
+				latCount += m.count
+			}
 		}
+		if latCount > 0 {
+			t.meanUs = sumUs / float64(latCount)
+		}
+		for win := range wins {
+			t.hist.Merge(d.hist[op][win])
+		}
+		totals[op] = t
+		fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", op, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 		if stats.IsCounter(op) {
-			fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", op, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 			row(w, "units/sec", stats.Summarize(rate, o.Deviation), true)
-			fmt.Fprintf(w, " Totals: %s units   avg %s units/s\n", grouped(int64(count)), num(float64(count)/runSecs))
 			continue
 		}
-		fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", op, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 		row(w, "ops/sec", stats.Summarize(rate, o.Deviation), true)
 		rowMs(w, "mean_ms", stats.Summarize(mean, o.Deviation), true)
 		rowMs(w, "p50_ms", stats.Summarize(p50, o.Deviation), true)
 		rowMs(w, "p99_ms", stats.Summarize(p99, o.Deviation), true)
 		row(w, "errors/win", stats.Summarize(errs, o.Deviation), true)
-		// overall quantiles from merged hist windows inside the analysis window
-		var h stats.Hist
-		for win := range wins {
-			h.Merge(d.hist[op][win])
+	}
+
+	fmt.Fprintf(w, "\n--- Client ops: run totals (%s analysed, all windows merged) ---\n", time.Duration(to-from)*time.Millisecond)
+	fmt.Fprint(w, " Percentiles come from the merged latency histogram; mean is count-weighted.\n\n")
+	first := true
+	for _, op := range ops {
+		if stats.IsCounter(op) {
+			continue
 		}
-		fmt.Fprintf(w, " Totals: %s ops (%s errors)   avg %s ops/s   overall p50=%s p99=%s p999=%s\n",
-			grouped(int64(count)), grouped(int64(errTotal)), num(float64(count)/runSecs),
-			stats.Ms(float64(h.Quantile(0.5))), stats.Ms(float64(h.Quantile(0.99))), stats.Ms(float64(h.Quantile(0.999))))
-		d.printErrorCodes(w, op, from, to)
+		if first {
+			fmt.Fprintf(w, " %-14s%12s%9s%11s%9s%9s%9s%9s%9s\n", "op", "ops", "errors", "avg ops/s", "mean", "p50", "p90", "p99", "p999")
+			first = false
+		}
+		t := totals[op]
+		fmt.Fprintf(w, " %-14s%12s%9s%11s%9s%9s%9s%9s%9s\n", op, grouped(int64(t.count)), grouped(int64(t.errs)),
+			num(float64(t.count)/runSecs), stats.Ms(t.meanUs), stats.Ms(float64(t.hist.Quantile(0.5))),
+			stats.Ms(float64(t.hist.Quantile(0.9))), stats.Ms(float64(t.hist.Quantile(0.99))), stats.Ms(float64(t.hist.Quantile(0.999))))
+	}
+	first = true
+	for _, op := range ops {
+		if !stats.IsCounter(op) {
+			continue
+		}
+		if first {
+			fmt.Fprintf(w, "\n %-14s%12s%14s\n", "counter", "units", "avg units/s")
+			first = false
+		}
+		t := totals[op]
+		fmt.Fprintf(w, " %-14s%12s%14s\n", op, grouped(int64(t.count)), num(float64(t.count)/runSecs))
+	}
+	for _, op := range ops {
+		if !stats.IsCounter(op) {
+			d.printErrorCodes(w, op, from, to)
+		}
 	}
 }
 
@@ -446,12 +492,8 @@ func sortedByCount(m map[string]uint64) []string {
 	return k
 }
 
-func (d *data) printCPU(w io.Writer, from, to int64) {
-	if len(d.cpu) == 0 {
-		return
-	}
-	fmt.Fprintln(w, "\n--- Worker CPU (client side, cores) ---")
-	fmt.Fprintf(w, " %-14s%9s%9s%9s%9s\n", "", "min", "max", "avg", "median")
+// cpuSources returns the cpu.csv sources in display order (workers naturally sorted, host last).
+func (d *data) cpuSources() []string {
 	var srcs []string
 	for k := range d.cpu {
 		srcs = append(srcs, k)
@@ -462,13 +504,223 @@ func (d *data) printCPU(w io.Writer, from, to int64) {
 		}
 		return natLess(srcs[i], srcs[j])
 	})
-	for _, s := range srcs {
-		sm := stats.Summarize(inSamples(d.cpu[s], from, to), 10)
-		label := strings.Replace(s, "-", " ", 1)
-		if s == "system" {
-			label = "system (host)"
+	return srcs
+}
+
+func cpuLabel(s string) string {
+	if s == "system" {
+		return "system (host)"
+	}
+	return strings.Replace(s, "-", " ", 1)
+}
+
+// cpuInterval is the median spacing of a source's samples in (from,to], in ms (0 if unknown).
+func cpuInterval(s []sample, from, to int64) int64 {
+	var gaps []int64
+	var prev int64
+	for _, x := range s {
+		if x.ts < from || x.ts > to {
+			continue
 		}
-		fmt.Fprintf(w, " %-14s%9s%9s%9s%9s\n", label, num(sm.Min), num(sm.Max), num(sm.Avg), num(sm.Median))
+		if prev != 0 {
+			gaps = append(gaps, x.ts-prev)
+		}
+		prev = x.ts
+	}
+	if len(gaps) == 0 {
+		return 0
+	}
+	sort.Slice(gaps, func(i, j int) bool { return gaps[i] < gaps[j] })
+	return gaps[len(gaps)/2]
+}
+
+// windowedStatsWarning returns "" when samples of a source can be assigned to display windows
+// of length winLen, or an explanation of why per-window statistics can't be produced. The
+// sampling interval must not be longer than the window, or windows would have no samples.
+func windowedStatsWarning(what, setting string, samples []sample, from, to int64, winLen time.Duration) string {
+	iv := cpuInterval(samples, from, to)
+	if iv == 0 {
+		return fmt.Sprintf("%s: too few samples in the analysed range to compute per-window statistics.", what)
+	}
+	if ivd := time.Duration(iv) * time.Millisecond; ivd > winLen {
+		return fmt.Sprintf("%s is sampled every ~%s, which is longer than the %s window, so some windows would have no samples. "+
+			"Use --window %s or longer (a whole multiple of the recorded window), or lower %s and re-run.",
+			what, ivd.Round(100*time.Millisecond), winLen, ivd.Round(time.Second), setting)
+	}
+	return ""
+}
+
+// windowsNote is the "N windows of W" part of a heading. When some windows had no samples it
+// says how many contributed, so the statistics aren't read as covering more than they do.
+func windowsNote(withData, total int, winLen time.Duration) string {
+	if withData == total {
+		return fmt.Sprintf("%d windows of %s", total, winLen)
+	}
+	return fmt.Sprintf("%d of %d windows of %s had samples", withData, total, winLen)
+}
+
+// windowHasSample reports whether any of the series has a sample in (start,end].
+func windowHasSample(win [2]int64, series ...[]sample) bool {
+	for _, s := range series {
+		for _, x := range s {
+			if x.ts > win[0] && x.ts <= win[1] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sampleNote describes a sampled series for a heading, e.g. "4 samples at ~5s".
+func sampleNote(samples []sample, from, to int64) string {
+	n := len(inSamples(samples, from, to))
+	iv := time.Duration(cpuInterval(samples, from, to)) * time.Millisecond
+	if iv == 0 {
+		return fmt.Sprintf("%d samples", n)
+	}
+	return fmt.Sprintf("%d samples at ~%s", n, iv.Round(100*time.Millisecond))
+}
+
+// cpuWindows returns the display windows as (start,end] ms ranges: one per recorded window
+// (k == 1) or one per complete group of k recorded windows, matching the Client ops series.
+func (d *data) cpuWindows(from, to int64, k int) [][2]int64 {
+	all := d.windowsInRange(from, to)
+	if k < 1 {
+		k = 1
+	}
+	var out [][2]int64
+	for b := 0; (b+1)*k <= len(all); b++ {
+		first, last := all[b*k], all[(b+1)*k-1]
+		start, ok := d.wend[first-1]
+		if !ok {
+			start = d.wend[first] - d.intervalMs
+		}
+		out = append(out, [2]int64{start, d.wend[last]})
+	}
+	return out
+}
+
+func (d *data) printCPU(w io.Writer, o Options, from, to int64) {
+	if len(d.cpu) == 0 {
+		return
+	}
+	srcs := d.cpuSources()
+	wins := d.cpuWindows(from, to, d.widen(o))
+	winLen := time.Duration(d.intervalMs) * time.Millisecond * time.Duration(d.widen(o))
+	runSecs := float64(to-from) / 1000
+	if runSecs <= 0 {
+		runSecs = 1
+	}
+
+	// Per-window series: mean of the samples that fall in each window. If the sampler is slower
+	// than the window the table is not produced; a warning explains why.
+	perWindow := len(wins) > 0 && d.intervalMs > 0
+	var cpuWarn string
+	if perWindow {
+		for _, s := range srcs {
+			if cpuWarn = windowedStatsWarning("Worker CPU", "cpu_sample_interval_ms", d.cpu[s], from, to, winLen); cpuWarn != "" {
+				perWindow = false
+				break
+			}
+		}
+	}
+	workers := 0
+	for _, s := range srcs {
+		if s != "system" {
+			workers++
+		}
+	}
+	if perWindow {
+		var all [][]sample
+		for _, s := range srcs {
+			all = append(all, d.cpu[s])
+		}
+		withData := 0
+		for _, win := range wins {
+			if windowHasSample(win, all...) {
+				withData++
+			}
+		}
+		fmt.Fprintf(w, "\n--- Worker CPU: per-window statistics (%s, cores) ---\n", windowsNote(withData, len(wins), winLen))
+		fmt.Fprint(w, " Each row is the mean of the CPU samples in each window; min/max/avg/median/pXX/dev% are taken across those windows.\n\n")
+		fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", "", "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
+		perSrc := map[string][]float64{}
+		sum := make([]float64, 0, len(wins))
+		for _, win := range wins {
+			var tot float64
+			complete := true
+			for _, s := range srcs {
+				var n int
+				var acc float64
+				for _, x := range d.cpu[s] {
+					if x.ts > win[0] && x.ts <= win[1] {
+						acc += x.v
+						n++
+					}
+				}
+				if n == 0 {
+					if s != "system" {
+						complete = false
+					}
+					continue
+				}
+				perSrc[s] = append(perSrc[s], acc/float64(n))
+				if s != "system" {
+					tot += acc / float64(n)
+				}
+			}
+			if complete && workers > 1 {
+				sum = append(sum, tot)
+			}
+		}
+		for _, s := range srcs {
+			row(w, cpuLabel(s), stats.Summarize(perSrc[s], o.Deviation), true)
+		}
+		if workers > 1 && len(sum) > 0 {
+			row(w, "all workers", stats.Summarize(sum, o.Deviation), true)
+		}
+	} else if cpuWarn != "" {
+		fmt.Fprintf(w, "\n[WARN] Worker CPU per-window statistics not shown. %s\n", cpuWarn)
+	}
+
+	// Run totals.
+	fmt.Fprintf(w, "\n--- Worker CPU: run totals (%s analysed, %s) ---\n", time.Duration(to-from)*time.Millisecond, sampleNote(d.cpu[srcs[0]], from, to))
+	fmt.Fprint(w, " Averages over every CPU sample in the run; \"all workers\" sums the per-worker averages.\n\n")
+	fmt.Fprintf(w, " %-14s%12s\n", "source", "avg cores")
+	var workerAvg float64
+	for _, s := range srcs {
+		if s == "system" {
+			continue
+		}
+		workerAvg += stats.Summarize(inSamples(d.cpu[s], from, to), o.Deviation).Avg
+	}
+	if workers > 1 {
+		fmt.Fprintf(w, " %-14s%12s\n", "all workers", num(workerAvg))
+	}
+	for _, s := range srcs {
+		if workers == 1 || s == "system" {
+			avg := stats.Summarize(inSamples(d.cpu[s], from, to), o.Deviation).Avg
+			fmt.Fprintf(w, " %-14s%12s\n", cpuLabel(s), num(avg))
+		}
+	}
+	// Client CPU cost per op, only when there is exactly one latency-bearing op.
+	var opNames []string
+	var count uint64
+	seen := map[string]bool{}
+	for _, m := range d.metrics {
+		if stats.IsCounter(m.op) || m.ts <= from || m.ts > to {
+			continue
+		}
+		if !seen[m.op] {
+			seen[m.op] = true
+			opNames = append(opNames, m.op)
+		}
+		count += m.count
+	}
+	if len(opNames) == 1 && count > 0 && workerAvg > 0 {
+		rate := float64(count) / runSecs
+		fmt.Fprintf(w, "\n client CPU efficiency: %s ops/s per core   (%s ops/s / %s cores, %s)\n",
+			num(rate/workerAvg), num(rate), num(workerAvg), opNames[0])
 	}
 }
 
@@ -505,12 +757,87 @@ func (d *data) serverDelta(name string, from, to int64) (float64, bool) {
 	return last - base, true
 }
 
-func (d *data) printServer(w io.Writer, from, to int64) {
+// printServerWindows prints per-window statistics of the server-side counters. Counters are
+// cumulative snapshots at window boundaries, so each display window's value is a delta.
+func (d *data) printServerWindows(w io.Writer, o Options, from, to int64, opNames []string) {
+	wins := d.cpuWindows(from, to, d.widen(o))
+	if len(wins) == 0 {
+		return
+	}
+	winLen := time.Duration(d.intervalMs) * time.Millisecond * time.Duration(d.widen(o))
+	fmt.Fprintf(w, "\n--- Server-side KVRGW: per-window statistics (%d windows of %s, summed over workers) ---\n", len(wins), winLen)
+	fmt.Fprint(w, " Each row is measured once per window; min/max/avg/median/pXX/dev% are taken across those windows.\n")
+	fmt.Fprint(w, " Latency and size rows are per-window means (the library exposes sums and counts, not histograms).\n")
+	hdr := func(name string) {
+		fmt.Fprintf(w, "\n %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", name, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
+	}
+	// delta returns the counter's change over window i; ok is false when it is missing or went
+	// backwards (a worker restart), so the window is left out of that row.
+	delta := func(name string, i int) (float64, bool) {
+		v, ok := d.serverDelta(name, wins[i][0], wins[i][1])
+		return v, ok && v >= 0
+	}
+	secs := func(i int) float64 { return float64(wins[i][1]-wins[i][0]) / 1000 }
+	// ratio collects num/den per window for windows where den > 0.
+	ratio := func(numName, denName string, scale float64) []float64 {
+		var out []float64
+		for i := range wins {
+			n, ok1 := delta(numName, i)
+			dn, ok2 := delta(denName, i)
+			if ok1 && ok2 && dn > 0 {
+				out = append(out, n/dn*scale)
+			}
+		}
+		return out
+	}
+	perSec := func(name string) []float64 {
+		var out []float64
+		for i := range wins {
+			if v, ok := delta(name, i); ok {
+				out = append(out, v/secs(i))
+			}
+		}
+		return out
+	}
+	perWin := func(name string) []float64 {
+		var out []float64
+		for i := range wins {
+			if v, ok := delta(name, i); ok {
+				out = append(out, v)
+			}
+		}
+		return out
+	}
+	sm := func(v []float64) stats.Summary { return stats.Summarize(v, o.Deviation) }
+	for _, op := range opNames {
+		if c, _ := d.serverDelta(op+".count", from, to); c <= 0 {
+			continue
+		}
+		hdr(op)
+		row(w, "ops/sec", sm(perSec(op+".count")), true)
+		rowMs(w, "avg_total_ms", sm(ratio(op+".total_us", op+".count", 1)), true)
+		if disk, _ := d.serverDelta(op+".disk_us", from, to); disk > 0 {
+			rowMs(w, "avg_disk_ms", sm(ratio(op+".disk_us", op+".count", 1)), true)
+		}
+	}
+	if c, ok := d.serverDelta("batch.commits", from, to); ok && c > 0 {
+		hdr("batches")
+		row(w, "commits/s", sm(perSec("batch.commits")), true)
+		row(w, "avg_size", sm(ratio("batch.entries", "batch.commits", 1)), true)
+		row(w, "avg_wait_us", sm(ratio("batch.wait_us_total", "batch.commits", 1)), true)
+		row(w, "avg_queue", sm(ratio("batch.queue_size_total", "batch.commits", 1)), true)
+		row(w, "pushbacks/win", sm(perWin("batch.conflict_pushbacks")), true)
+	}
+	hdr("txn")
+	row(w, "retries/win", sm(perWin("txn.retries")), true)
+	row(w, "hard_fails/win", sm(perWin("txn.hard_failures")), true)
+}
+
+func (d *data) printServer(w io.Writer, o Options, from, to int64) {
 	if len(d.server) == 0 {
 		return
 	}
 	secs := float64(to-from) / 1000
-	fmt.Fprintln(w, "\n--- Server-side KVRGW (summed over workers) ---")
 	var opNames []string
 	for n := range d.server {
 		if op, ok := strings.CutSuffix(n, ".count"); ok && !strings.HasPrefix(n, "batch.") && !strings.HasPrefix(n, "txn.") {
@@ -518,6 +845,8 @@ func (d *data) printServer(w io.Writer, from, to int64) {
 		}
 	}
 	sort.Strings(opNames)
+	d.printServerWindows(w, o, from, to, opNames)
+	fmt.Fprintf(w, "\n--- Server-side KVRGW: run totals (%s analysed, summed over workers) ---\n", time.Duration(to-from)*time.Millisecond)
 	// The library does not instrument FDB get/commit/scan time (the hooks are never
 	// called), so only count, avg_total and, if any is non-zero, avg_disk are reported.
 	type opRow struct {
@@ -536,13 +865,13 @@ func (d *data) printServer(w io.Writer, from, to int64) {
 		rows = append(rows, r)
 	}
 	if len(rows) > 0 {
-		fmt.Fprintf(w, " %-14s%12s%14s", "op", "count", "avg_total_ms")
+		fmt.Fprintf(w, " %-14s%12s%12s%14s", "op", "count", "avg ops/s", "avg_total_ms")
 		if showDisk {
 			fmt.Fprintf(w, "%13s", "avg_disk_ms")
 		}
 		fmt.Fprintln(w)
 		for _, r := range rows {
-			fmt.Fprintf(w, " %-14s%12s%14s", r.op, grouped(int64(r.count)), stats.MsNum(r.total))
+			fmt.Fprintf(w, " %-14s%12s%12s%14s", r.op, grouped(int64(r.count)), num(r.count/secs), stats.MsNum(r.total))
 			if showDisk {
 				fmt.Fprintf(w, "%13s", stats.MsNum(r.disk))
 			}
@@ -652,14 +981,57 @@ func roleLabel(role string) string {
 	return "SL "
 }
 
+type fdbCol struct {
+	label, col string
+	scale      float64
+}
+
+var fdbClusterCols = []fdbCol{{"txn/s", "txn_hz", 1}, {"reads/s", "reads_hz", 1}, {"writes/s", "writes_hz", 1},
+	{"conflicts/s", "conflict_hz", 1}, {"worst SS queue (MB)", "worst_queue_ss", 1e6}, {"durability lag (s)", "durability_lag_s", 1}}
+
 func (d *data) printFDB(w io.Writer, o Options, from, to int64) {
-	fmt.Fprintln(w, "\n--- FDB cluster ---")
+	winLen := time.Duration(d.intervalMs) * time.Millisecond * time.Duration(d.widen(o))
+	wins := d.cpuWindows(from, to, d.widen(o))
+	if len(wins) > 0 && d.intervalMs > 0 {
+		warn := windowedStatsWarning("FDB cluster", "fdb_sample_interval_ms", d.fdbCluster["txn_hz"], from, to, winLen)
+		if warn != "" {
+			fmt.Fprintf(w, "\n[WARN] FDB cluster per-window statistics not shown. %s\n", warn)
+		} else {
+			withData := 0
+			for _, win := range wins {
+				if windowHasSample(win, d.fdbCluster["txn_hz"]) {
+					withData++
+				}
+			}
+			fmt.Fprintf(w, "\n--- FDB cluster: per-window statistics (%s) ---\n", windowsNote(withData, len(wins), winLen))
+			fmt.Fprint(w, " Each row is the mean of the FDB status samples in each window; min/max/avg/median/pXX/dev% are taken across those windows.\n\n")
+			fmt.Fprintf(w, " %-22s%9s%9s%9s%9s%9s%9s%9s%8s\n", "", "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
+			for _, c := range fdbClusterCols {
+				var vals []float64
+				for _, win := range wins {
+					var acc float64
+					var n int
+					for _, x := range d.fdbCluster[c.col] {
+						if x.ts > win[0] && x.ts <= win[1] {
+							acc += x.v / c.scale
+							n++
+						}
+					}
+					if n > 0 {
+						vals = append(vals, acc/float64(n))
+					}
+				}
+				s := stats.Summarize(vals, o.Deviation)
+				fmt.Fprintf(w, " %-22s%9s%9s%9s%9s%9s%9s%9s%7.1f%%\n", c.label, num(s.Min), num(s.Max), num(s.Avg), num(s.Median),
+					num(s.P90), num(s.P95), num(s.P99), s.DevPct)
+			}
+		}
+	}
+
+	fmt.Fprintf(w, "\n--- FDB cluster: run totals (%s analysed, %s) ---\n", time.Duration(to-from)*time.Millisecond, sampleNote(d.fdbCluster["txn_hz"], from, to))
+	fmt.Fprint(w, " Each row summarises every FDB status sample in the run.\n\n")
 	fmt.Fprintf(w, " %-22s%9s%9s%9s%9s\n", "", "min", "max", "avg", "median")
-	for _, c := range []struct {
-		label, col string
-		scale      float64
-	}{{"txn/s", "txn_hz", 1}, {"reads/s", "reads_hz", 1}, {"writes/s", "writes_hz", 1}, {"conflicts/s", "conflict_hz", 1},
-		{"worst SS queue (MB)", "worst_queue_ss", 1e6}, {"durability lag (s)", "durability_lag_s", 1}} {
+	for _, c := range fdbClusterCols {
 		v := inSamples(d.fdbCluster[c.col], from, to)
 		for i := range v {
 			v[i] /= c.scale
@@ -824,6 +1196,20 @@ func (d *data) windowsInRange(from, to int64) []int64 {
 		}
 	}
 	sort.Slice(ws, func(i, j int) bool { return ws[i] < ws[j] })
+	// The run's final window is usually a stub (the run ends a few ms after a boundary). Its
+	// rates and latencies come from very few requests, so leave it out of windowed statistics.
+	// Run totals are built from the raw rows and still include it.
+	if n := len(ws); n > 0 && d.intervalMs > 0 {
+		last := int64(-1)
+		for w := range d.wend {
+			if w > last {
+				last = w
+			}
+		}
+		if ws[n-1] == last && d.windowDur(last) < float64(d.intervalMs)/2000 {
+			ws = ws[:n-1]
+		}
+	}
 	return ws
 }
 

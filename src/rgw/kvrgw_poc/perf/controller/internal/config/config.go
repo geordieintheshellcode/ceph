@@ -103,7 +103,7 @@ func Defaults() Config {
 		VerifyThreads: 4, TenantName: envOr("KVRGW_TENANT_NAME", "kv-poc"),
 		ReportIntervalMs: 1000,
 		FdbStats:         true, FdbClusterFile: os.Getenv("FDB_CLUSTER_FILE"), FdbcliPath: "/opt/foundationdb/usr/bin/fdbcli",
-		FdbSampleIntervalMs: 2000, CpuSampleIntervalMs: 1000,
+		FdbSampleIntervalMs: 5000, CpuSampleIntervalMs: 1000,
 		PageSize: 1000, NumObjectsToOverwrite: 100000,
 		Kvrgw: KvrgwConfig{MaxInline: 256, MaxKvStore: 4096, BatchSize: 5, BatchTimeoutUs: 1000, BatchThreads: 8},
 	}

@@ -107,14 +107,14 @@ func TestWarmupWindowing(t *testing.T) {
 	}
 	// Totals: sum 1100..2000 = 15500 ops from merged hist windows only.
 	// 15,500 ops over the 10s analysed window => 1,550 ops/s average; latencies in ms (3 s.f.)
-	if !strings.Contains(out, "Totals: 15,500 ops (0 errors)   avg 1,550 ops/s") || !strings.Contains(out, "p50=0.146ms") {
+	if !strings.Contains(out, "put_object          15,500        0      1,550   1.00ms  0.146ms") {
 		t.Fatalf("totals:\n%s", out)
 	}
 	if !strings.Contains(out, "Verify    : PASS  (4 buckets") {
 		t.Fatalf("verify line:\n%s", out)
 	}
 	// server stats diffed over the window: 100 ops per window x 10 windows... count delta = 2000-1000.
-	if !strings.Contains(out, "avg_total_ms") || !hasRow(out, "PutObject", "1,000", "0.500") ||
+	if !strings.Contains(out, "avg_total_ms") || !hasRow(out, "PutObject", "1,000", "100", "0.500") ||
 		strings.Contains(out, "avg_fdb") || strings.Contains(out, "commit=") {
 		t.Fatalf("server avg:\n%s", out)
 	}
@@ -136,7 +136,7 @@ func TestErrorBreakdown(t *testing.T) {
 
 func TestNoWarmupIncludesAllWindows(t *testing.T) {
 	out, _ := render(t, fixture(t, false), Options{})
-	if !strings.Contains(out, "20 windows of 1s") || !strings.Contains(out, "Totals: 21,000 ops") {
+	if !strings.Contains(out, "20 windows of 1s") || !strings.Contains(out, "21,000") {
 		t.Fatalf("\n%s", out)
 	}
 }
@@ -146,7 +146,7 @@ func TestDevPercent(t *testing.T) {
 	out, _ := render(t, fixture(t, false), Options{Warmup: 10 * time.Second, Deviation: 10})
 	var line string
 	for _, l := range strings.Split(out, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(l), "ops/sec") {
+		if strings.HasPrefix(strings.TrimSpace(l), "ops/sec") && line == "" {
 			line = l
 		}
 	}
@@ -224,7 +224,7 @@ func TestWiden(t *testing.T) {
 	var ops, p50 string
 	for _, l := range strings.Split(out, "\n") {
 		switch f := strings.Fields(l); {
-		case len(f) > 0 && f[0] == "ops/sec":
+		case len(f) > 0 && f[0] == "ops/sec" && ops == "":
 			ops = l
 		case len(f) > 0 && f[0] == "p50_ms":
 			p50 = l
@@ -239,7 +239,7 @@ func TestWiden(t *testing.T) {
 		t.Fatalf("p50 should come from merged histograms: %q", p50)
 	}
 	// Totals still cover every recorded window in range.
-	if !strings.Contains(out, "Totals: 15,500 ops") {
+	if !strings.Contains(out, "15,500") {
 		t.Fatalf("totals:\n%s", out)
 	}
 }
@@ -247,7 +247,7 @@ func TestWiden(t *testing.T) {
 func TestWidenDropsTrailingPartialWindow(t *testing.T) {
 	// 20 recorded windows in range; 8s windows => 2 complete (16 windows), 4 left over.
 	out, _ := render(t, fixture(t, false), Options{Window: 8 * time.Second})
-	if !strings.Contains(out, "(2 windows of 8s)") || !strings.Contains(out, "Totals: 21,000 ops") {
+	if !strings.Contains(out, "(2 windows of 8s)") || !strings.Contains(out, "21,000") {
 		t.Fatalf("\n%s", out)
 	}
 }
@@ -264,5 +264,78 @@ func TestWidenValidation(t *testing.T) {
 	b, _ := render(t, dir, Options{})
 	if a != b {
 		t.Fatal("--window equal to the recorded window must not change the report")
+	}
+}
+
+func TestWorkerCPUWindowsAndTotals(t *testing.T) {
+	out, _ := render(t, fixture(t, false), Options{Warmup: 10 * time.Second})
+	for _, want := range []string{"Worker CPU: per-window statistics (10 windows of 1s", "Worker CPU: run totals (10s analysed", "source", "system (host)"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestServerWindowsAndTotals(t *testing.T) {
+	out, _ := render(t, fixture(t, false), Options{Warmup: 10 * time.Second})
+	for _, want := range []string{"Server-side KVRGW: per-window statistics (10 windows of 1s", "Server-side KVRGW: run totals (10s analysed", "avg ops/s"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestWindowedStatsWarning(t *testing.T) {
+	var s []sample
+	for i := int64(1); i <= 10; i++ {
+		s = append(s, sample{ts: i * 5000, v: 1})
+	}
+	if w := windowedStatsWarning("FDB cluster", "fdb_sample_interval_ms", s, 0, 50000, time.Second); !strings.Contains(w, "every ~5s") ||
+		!strings.Contains(w, "--window 5s or longer") || !strings.Contains(w, "fdb_sample_interval_ms") {
+		t.Fatalf("warning: %q", w)
+	}
+	if w := windowedStatsWarning("FDB cluster", "x", s, 0, 50000, 5*time.Second); w != "" {
+		t.Fatalf("interval == window should be fine: %q", w)
+	}
+	if w := windowedStatsWarning("FDB cluster", "x", s[:1], 0, 50000, time.Second); !strings.Contains(w, "too few samples") {
+		t.Fatalf("few samples: %q", w)
+	}
+}
+
+func TestFDBPerWindow(t *testing.T) {
+	out, _ := render(t, fixture(t, false), Options{Warmup: 10 * time.Second})
+	if !strings.Contains(out, "FDB cluster: per-window statistics (9 of 10 windows of 1s had samples)") || !strings.Contains(out, "FDB cluster: run totals") {
+		t.Fatalf("\n%s", out)
+	}
+}
+
+func TestTrailingStubWindowDropped(t *testing.T) {
+	d := &data{intervalMs: 1000, startMs: 0, wend: map[int64]int64{0: 1000, 1: 2000, 2: 3000, 3: 3024}}
+	if got := d.windowsInRange(0, 1<<40); len(got) != 3 || got[2] != 2 {
+		t.Fatalf("stub window should be dropped: %v", got)
+	}
+	d.wend[3] = 3800 // a long final window is kept
+	if got := d.windowsInRange(0, 1<<40); len(got) != 4 {
+		t.Fatalf("long final window should be kept: %v", got)
+	}
+}
+
+func TestSampleNote(t *testing.T) {
+	s := []sample{{1000, 1}, {6000, 1}, {11000, 1}}
+	if got := sampleNote(s, 0, 20000); got != "3 samples at ~5s" {
+		t.Fatalf("%q", got)
+	}
+}
+
+func TestWindowsNote(t *testing.T) {
+	if got := windowsNote(3, 3, 10*time.Second); got != "3 windows of 10s" {
+		t.Fatal(got)
+	}
+	if got := windowsNote(2, 3, 10*time.Second); got != "2 of 3 windows of 10s had samples" {
+		t.Fatal(got)
+	}
+	s := []sample{{1500, 1}}
+	if !windowHasSample([2]int64{1000, 2000}, s) || windowHasSample([2]int64{2000, 3000}, s) {
+		t.Fatal("windowHasSample")
 	}
 }

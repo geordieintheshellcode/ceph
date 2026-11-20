@@ -320,7 +320,7 @@ and `perf_driver.cpp` (`KVRGW_*` env handling, key prefix/suffix lengths,
 | `fdb_stats` | true | controller samples `fdbcli status json` (§8.2); disable with `--no-fdb-stats` |
 | `fdb_cluster_file` | `$FDB_CLUSTER_FILE` | cluster file passed to `fdbcli -C` |
 | `fdbcli_path` | `fdbcli` (on `PATH`) | fdbcli binary |
-| `fdb_sample_interval_ms` | 2000 | FDB status poll period |
+| `fdb_sample_interval_ms` | 5000 | FDB status poll period |
 | `cpu_sample_interval_ms` | 1000 | worker/system CPU sample period |
 | `ops` / `duration` | — | run-* only; exactly one |
 

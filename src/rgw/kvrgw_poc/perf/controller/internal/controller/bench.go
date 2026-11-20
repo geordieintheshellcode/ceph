@@ -229,8 +229,16 @@ func (v *invocation) handleWindows(wins []*stats.Window) {
 		}
 		v.lastServer = w.Server
 		v.windows++
-		fmt.Fprintf(v.out, "[win %4d] %s\n", w.Index, strings.Join(parts, " | "))
+		fmt.Fprintf(v.out, "[t=%s] %s\n", fmtOffset(w.Index*v.intervalMs), strings.Join(parts, " | "))
 	}
+}
+
+// fmtOffset renders a millisecond offset from run start as e.g. "0s", "10s", "1.5s".
+func fmtOffset(ms int64) string {
+	if ms%1000 == 0 {
+		return fmt.Sprintf("%ds", ms/1000)
+	}
+	return fmt.Sprintf("%.1fs", float64(ms)/1000)
 }
 
 func human(f float64) string {
