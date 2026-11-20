@@ -23,6 +23,8 @@ type Options struct {
 	Warmup    time.Duration
 	Deviation float64
 	PerServer bool
+	// Detailed adds the per-window statistics tables; by default only run totals are printed.
+	Detailed bool
 	// Window widens the recorded windows of the client-ops table to this size (0 = as
 	// recorded). It must be a whole multiple of the recorded window.
 	Window time.Duration
@@ -265,6 +267,10 @@ func num(v float64) string {
 	switch {
 	case v == 0:
 		return "0"
+	case a >= 1e9:
+		return fmt.Sprintf("%.2fG", v/1e9)
+	case a >= 1e6:
+		return fmt.Sprintf("%.2fM", v/1e6)
 	case a >= 100:
 		return grouped(int64(math.Round(v)))
 	case a >= 10:
@@ -369,8 +375,11 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 	k := d.widen(o)
 	winLen := time.Duration(d.intervalMs) * time.Millisecond * time.Duration(k)
 	nwin := len(d.series(ops[0], from, to, k))
-	fmt.Fprintf(w, "\n--- Client ops: per-window statistics (%d windows of %s, merged across workers) ---\n", nwin, winLen)
-	fmt.Fprint(w, " Each row is measured once per window; min/max/avg/median/pXX/dev% are taken across those windows.\n\n")
+	banner(w, "Client ops")
+	// The per-window tables are only printed with --detailed; the loop below also builds the
+	// totals, so it always runs and writes to pw.
+	pw := detailedWriter(w, o)
+	subHeading(pw, "Per-window statistics", fmt.Sprintf("%d windows of %s, merged across workers", nwin, winLen), windowNote)
 	type total struct {
 		count, errs uint64
 		meanUs      float64
@@ -413,33 +422,36 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 			t.hist.Merge(d.hist[op][win])
 		}
 		totals[op] = t
-		fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", op, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
+		if op != ops[0] {
+			fmt.Fprintln(pw)
+		}
+		fmt.Fprintf(pw, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", op, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 		if stats.IsCounter(op) {
-			row(w, "units/sec", stats.Summarize(rate, o.Deviation), true)
+			row(pw, "keys/sec", stats.Summarize(rate, o.Deviation), true)
 			continue
 		}
-		row(w, "ops/sec", stats.Summarize(rate, o.Deviation), true)
-		rowMs(w, "mean_ms", stats.Summarize(mean, o.Deviation), true)
-		rowMs(w, "p50_ms", stats.Summarize(p50, o.Deviation), true)
-		rowMs(w, "p99_ms", stats.Summarize(p99, o.Deviation), true)
-		row(w, "errors/win", stats.Summarize(errs, o.Deviation), true)
+		row(pw, "ops/sec", stats.Summarize(rate, o.Deviation), true)
+		rowMs(pw, "mean_ms", stats.Summarize(mean, o.Deviation), true)
+		rowMs(pw, "p50_ms", stats.Summarize(p50, o.Deviation), true)
+		rowMs(pw, "p99_ms", stats.Summarize(p99, o.Deviation), true)
+		row(pw, "errors/win", stats.Summarize(errs, o.Deviation), true)
 	}
 
-	fmt.Fprintf(w, "\n--- Client ops: run totals (%s analysed, all windows merged) ---\n", time.Duration(to-from)*time.Millisecond)
-	fmt.Fprint(w, " Percentiles come from the merged latency histogram; mean is count-weighted.\n\n")
+	subHeading(w, "Run totals", fmt.Sprintf("%s analysed, all windows merged", time.Duration(to-from)*time.Millisecond),
+		"percentiles come from the merged latency histogram; mean is count-weighted")
 	first := true
 	for _, op := range ops {
 		if stats.IsCounter(op) {
 			continue
 		}
 		if first {
-			fmt.Fprintf(w, " %-14s%12s%9s%11s%9s%9s%9s%9s%9s\n", "op", "ops", "errors", "avg ops/s", "mean", "p50", "p90", "p99", "p999")
+			fmt.Fprintf(w, " %-14s%12s%9s%11s%9s%9s%9s%9s%9s\n", "op", "ops", "errors", "avg ops/s", "mean_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms")
 			first = false
 		}
 		t := totals[op]
 		fmt.Fprintf(w, " %-14s%12s%9s%11s%9s%9s%9s%9s%9s\n", op, grouped(int64(t.count)), grouped(int64(t.errs)),
-			num(float64(t.count)/runSecs), stats.Ms(t.meanUs), stats.Ms(float64(t.hist.Quantile(0.5))),
-			stats.Ms(float64(t.hist.Quantile(0.9))), stats.Ms(float64(t.hist.Quantile(0.99))), stats.Ms(float64(t.hist.Quantile(0.999))))
+			num(float64(t.count)/runSecs), stats.MsNum(t.meanUs), stats.MsNum(float64(t.hist.Quantile(0.5))),
+			stats.MsNum(float64(t.hist.Quantile(0.9))), stats.MsNum(float64(t.hist.Quantile(0.99))), stats.MsNum(float64(t.hist.Quantile(0.999))))
 	}
 	first = true
 	for _, op := range ops {
@@ -447,7 +459,7 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 			continue
 		}
 		if first {
-			fmt.Fprintf(w, "\n %-14s%12s%14s\n", "counter", "units", "avg units/s")
+			fmt.Fprintf(w, "\n %-14s%12s%14s\n", "op", "keys", "avg keys/s")
 			first = false
 		}
 		t := totals[op]
@@ -468,6 +480,9 @@ func (d *data) printErrorCodes(w io.Writer, op string, from, to int64) {
 		if e.op == op && e.ts > from && e.ts <= to {
 			codes[e.code] += e.count
 		}
+	}
+	if len(codes) > 0 {
+		fmt.Fprintln(w)
 	}
 	for _, c := range sortedByCount(codes) {
 		line := fmt.Sprintf("   errors: %-28s x%d", stats.ShortCode(c), codes[c])
@@ -550,6 +565,37 @@ func windowedStatsWarning(what, setting string, samples []sample, from, to int64
 	return ""
 }
 
+// detailedWriter returns w with --detailed, else a writer that discards, so per-window code
+// paths can stay in place without printing.
+func detailedWriter(w io.Writer, o Options) io.Writer {
+	if o.Detailed {
+		return w
+	}
+	return io.Discard
+}
+
+// banner prints a section heading: a full-width rule, the upper-case title and another rule.
+func banner(w io.Writer, title string) {
+	rule := strings.Repeat("=", 74)
+	fmt.Fprintf(w, "\n%s\n %s\n%s\n", rule, strings.ToUpper(title), rule)
+}
+
+// subHeading prints a table heading within a section: the table type and its details on one
+// line, a light rule, then each note in parentheses and a blank line before the table.
+func subHeading(w io.Writer, title, detail string, notes ...string) {
+	line := " " + title
+	if detail != "" {
+		line += "   " + detail
+	}
+	fmt.Fprintf(w, "\n%s\n %s\n", line, strings.Repeat("-", 72))
+	for _, n := range notes {
+		fmt.Fprintf(w, " (%s)\n", n)
+	}
+	fmt.Fprintln(w)
+}
+
+const windowNote = "each row is measured once per window; min/max/avg/median/pXX/dev% are taken across those windows"
+
 // windowsNote is the "N windows of W" part of a heading. When some windows had no samples it
 // says how many contributed, so the statistics aren't read as covering more than they do.
 func windowsNote(withData, total int, winLen time.Duration) string {
@@ -604,6 +650,7 @@ func (d *data) printCPU(w io.Writer, o Options, from, to int64) {
 	if len(d.cpu) == 0 {
 		return
 	}
+	banner(w, "Worker CPU")
 	srcs := d.cpuSources()
 	wins := d.cpuWindows(from, to, d.widen(o))
 	winLen := time.Duration(d.intervalMs) * time.Millisecond * time.Duration(d.widen(o))
@@ -630,7 +677,7 @@ func (d *data) printCPU(w io.Writer, o Options, from, to int64) {
 			workers++
 		}
 	}
-	if perWindow {
+	if o.Detailed && perWindow {
 		var all [][]sample
 		for _, s := range srcs {
 			all = append(all, d.cpu[s])
@@ -641,8 +688,8 @@ func (d *data) printCPU(w io.Writer, o Options, from, to int64) {
 				withData++
 			}
 		}
-		fmt.Fprintf(w, "\n--- Worker CPU: per-window statistics (%s, cores) ---\n", windowsNote(withData, len(wins), winLen))
-		fmt.Fprint(w, " Each row is the mean of the CPU samples in each window; min/max/avg/median/pXX/dev% are taken across those windows.\n\n")
+		subHeading(w, "Per-window statistics", windowsNote(withData, len(wins), winLen)+", cores",
+			"each row is the mean of the CPU samples in each window; min/max/avg/median/pXX/dev% are taken across those windows")
 		fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", "", "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 		perSrc := map[string][]float64{}
 		sum := make([]float64, 0, len(wins))
@@ -679,13 +726,14 @@ func (d *data) printCPU(w io.Writer, o Options, from, to int64) {
 		if workers > 1 && len(sum) > 0 {
 			row(w, "all workers", stats.Summarize(sum, o.Deviation), true)
 		}
-	} else if cpuWarn != "" {
-		fmt.Fprintf(w, "\n[WARN] Worker CPU per-window statistics not shown. %s\n", cpuWarn)
+	} else if o.Detailed && cpuWarn != "" {
+		subHeading(w, "Per-window statistics", "not shown")
+		fmt.Fprintf(w, " [WARN] %s\n", cpuWarn)
 	}
 
 	// Run totals.
-	fmt.Fprintf(w, "\n--- Worker CPU: run totals (%s analysed, %s) ---\n", time.Duration(to-from)*time.Millisecond, sampleNote(d.cpu[srcs[0]], from, to))
-	fmt.Fprint(w, " Averages over every CPU sample in the run; \"all workers\" sums the per-worker averages.\n\n")
+	subHeading(w, "Run totals", fmt.Sprintf("%s analysed, %s", time.Duration(to-from)*time.Millisecond, sampleNote(d.cpu[srcs[0]], from, to)),
+		"averages over every CPU sample in the run; \"all workers\" sums the per-worker averages")
 	fmt.Fprintf(w, " %-14s%12s\n", "source", "avg cores")
 	var workerAvg float64
 	for _, s := range srcs {
@@ -765,11 +813,16 @@ func (d *data) printServerWindows(w io.Writer, o Options, from, to int64, opName
 		return
 	}
 	winLen := time.Duration(d.intervalMs) * time.Millisecond * time.Duration(d.widen(o))
-	fmt.Fprintf(w, "\n--- Server-side KVRGW: per-window statistics (%d windows of %s, summed over workers) ---\n", len(wins), winLen)
-	fmt.Fprint(w, " Each row is measured once per window; min/max/avg/median/pXX/dev% are taken across those windows.\n")
-	fmt.Fprint(w, " Latency and size rows are per-window means (the library exposes sums and counts, not histograms).\n")
+	subHeading(w, "Per-window statistics", fmt.Sprintf("%d windows of %s, summed over workers", len(wins), winLen), windowNote,
+		"latency and size rows are per-window means; the library exposes sums and counts, not histograms")
+	firstHdr := true
 	hdr := func(name string) {
-		fmt.Fprintf(w, "\n %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", name, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
+		if firstHdr {
+			firstHdr = false
+		} else {
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintf(w, " %-14s%9s%9s%9s%9s%9s%9s%9s%8s\n", name, "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 	}
 	// delta returns the counter's change over window i; ok is false when it is missing or went
 	// backwards (a worker restart), so the window is left out of that row.
@@ -837,6 +890,7 @@ func (d *data) printServer(w io.Writer, o Options, from, to int64) {
 	if len(d.server) == 0 {
 		return
 	}
+	banner(w, "Server-side KVRGW")
 	secs := float64(to-from) / 1000
 	var opNames []string
 	for n := range d.server {
@@ -845,8 +899,10 @@ func (d *data) printServer(w io.Writer, o Options, from, to int64) {
 		}
 	}
 	sort.Strings(opNames)
-	d.printServerWindows(w, o, from, to, opNames)
-	fmt.Fprintf(w, "\n--- Server-side KVRGW: run totals (%s analysed, summed over workers) ---\n", time.Duration(to-from)*time.Millisecond)
+	if o.Detailed {
+		d.printServerWindows(w, o, from, to, opNames)
+	}
+	subHeading(w, "Run totals", fmt.Sprintf("%s analysed, summed over workers", time.Duration(to-from)*time.Millisecond))
 	// The library does not instrument FDB get/commit/scan time (the hooks are never
 	// called), so only count, avg_total and, if any is non-zero, avg_disk are reported.
 	type opRow struct {
@@ -990,12 +1046,14 @@ var fdbClusterCols = []fdbCol{{"txn/s", "txn_hz", 1}, {"reads/s", "reads_hz", 1}
 	{"conflicts/s", "conflict_hz", 1}, {"worst SS queue (MB)", "worst_queue_ss", 1e6}, {"durability lag (s)", "durability_lag_s", 1}}
 
 func (d *data) printFDB(w io.Writer, o Options, from, to int64) {
+	banner(w, "FDB cluster")
 	winLen := time.Duration(d.intervalMs) * time.Millisecond * time.Duration(d.widen(o))
 	wins := d.cpuWindows(from, to, d.widen(o))
-	if len(wins) > 0 && d.intervalMs > 0 {
+	if o.Detailed && len(wins) > 0 && d.intervalMs > 0 {
 		warn := windowedStatsWarning("FDB cluster", "fdb_sample_interval_ms", d.fdbCluster["txn_hz"], from, to, winLen)
 		if warn != "" {
-			fmt.Fprintf(w, "\n[WARN] FDB cluster per-window statistics not shown. %s\n", warn)
+			subHeading(w, "Per-window statistics", "not shown")
+			fmt.Fprintf(w, " [WARN] %s\n", warn)
 		} else {
 			withData := 0
 			for _, win := range wins {
@@ -1003,8 +1061,8 @@ func (d *data) printFDB(w io.Writer, o Options, from, to int64) {
 					withData++
 				}
 			}
-			fmt.Fprintf(w, "\n--- FDB cluster: per-window statistics (%s) ---\n", windowsNote(withData, len(wins), winLen))
-			fmt.Fprint(w, " Each row is the mean of the FDB status samples in each window; min/max/avg/median/pXX/dev% are taken across those windows.\n\n")
+			subHeading(w, "Per-window statistics", windowsNote(withData, len(wins), winLen),
+				"each row is the mean of the FDB status samples in each window; min/max/avg/median/pXX/dev% are taken across those windows")
 			fmt.Fprintf(w, " %-22s%9s%9s%9s%9s%9s%9s%9s%8s\n", "", "min", "max", "avg", "median", "p90", "p95", "p99", "dev%")
 			for _, c := range fdbClusterCols {
 				var vals []float64
@@ -1028,8 +1086,8 @@ func (d *data) printFDB(w io.Writer, o Options, from, to int64) {
 		}
 	}
 
-	fmt.Fprintf(w, "\n--- FDB cluster: run totals (%s analysed, %s) ---\n", time.Duration(to-from)*time.Millisecond, sampleNote(d.fdbCluster["txn_hz"], from, to))
-	fmt.Fprint(w, " Each row summarises every FDB status sample in the run.\n\n")
+	subHeading(w, "Run totals", fmt.Sprintf("%s analysed, %s", time.Duration(to-from)*time.Millisecond, sampleNote(d.fdbCluster["txn_hz"], from, to)),
+		"each row summarises every FDB status sample in the run")
 	fmt.Fprintf(w, " %-22s%9s%9s%9s%9s\n", "", "min", "max", "avg", "median")
 	for _, c := range fdbClusterCols {
 		v := inSamples(d.fdbCluster[c.col], from, to)
@@ -1041,7 +1099,8 @@ func (d *data) printFDB(w io.Writer, o Options, from, to int64) {
 	}
 
 	procs := d.procStats(from, to)
-	fmt.Fprintln(w, "\n--- FDB by role ---")
+	banner(w, "FDB by role")
+	fmt.Fprintln(w)
 	if o.PerServer {
 		for _, p := range procs {
 			m := p.med
@@ -1115,7 +1174,8 @@ func (d *data) printFDB(w io.Writer, o Options, from, to int64) {
 		}
 	}
 
-	fmt.Fprintln(w, "\n--- Health ---")
+	banner(w, "Health")
+	fmt.Fprintln(w)
 	bad := 0
 	for _, p := range procs {
 		if p.flag != "" {

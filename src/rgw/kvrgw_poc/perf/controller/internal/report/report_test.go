@@ -90,7 +90,7 @@ func render(t *testing.T, dir string, o Options) (string, int) {
 
 func TestWarmupWindowing(t *testing.T) {
 	dir := fixture(t, false)
-	out, code := render(t, dir, Options{Warmup: 10 * time.Second})
+	out, code := render(t, dir, Options{Detailed: true, Warmup: 10 * time.Second})
 	if code != 0 {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
@@ -107,7 +107,7 @@ func TestWarmupWindowing(t *testing.T) {
 	}
 	// Totals: sum 1100..2000 = 15500 ops from merged hist windows only.
 	// 15,500 ops over the 10s analysed window => 1,550 ops/s average; latencies in ms (3 s.f.)
-	if !strings.Contains(out, "put_object          15,500        0      1,550   1.00ms  0.146ms") {
+	if !strings.Contains(out, "put_object          15,500        0      1,550     1.00    0.146") {
 		t.Fatalf("totals:\n%s", out)
 	}
 	if !strings.Contains(out, "Verify    : PASS  (4 buckets") {
@@ -143,7 +143,7 @@ func TestNoWarmupIncludesAllWindows(t *testing.T) {
 
 func TestDevPercent(t *testing.T) {
 	// ops/sec series 1100..2000 (10 windows): median 1550; |v-med|/med>10% for most values.
-	out, _ := render(t, fixture(t, false), Options{Warmup: 10 * time.Second, Deviation: 10})
+	out, _ := render(t, fixture(t, false), Options{Detailed: true, Warmup: 10 * time.Second, Deviation: 10})
 	var line string
 	for _, l := range strings.Split(out, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(l), "ops/sec") && line == "" {
@@ -154,7 +154,7 @@ func TestDevPercent(t *testing.T) {
 	if !strings.Contains(line, "60.0%") {
 		t.Fatalf("ops/sec line %q", line)
 	}
-	out, _ = render(t, fixture(t, false), Options{Warmup: 10 * time.Second, Deviation: 100})
+	out, _ = render(t, fixture(t, false), Options{Detailed: true, Warmup: 10 * time.Second, Deviation: 100})
 	if strings.Contains(out, "60.0%") {
 		t.Fatal("deviation flag ignored")
 	}
@@ -169,7 +169,7 @@ func TestRoleAggregationVsPerServer(t *testing.T) {
 	if !strings.Contains(agg, "cpu=0.50-0.97") {
 		t.Fatalf("range:\n%s", agg)
 	}
-	byRole := strings.Split(strings.Split(agg, "--- FDB by role ---")[1], "--- Health ---")[0]
+	byRole := strings.Split(strings.Split(agg, "FDB BY ROLE")[1], "HEALTH")[0]
 	if strings.Contains(byRole, "10.0.0.3:4503") {
 		t.Fatal("aggregated view must not list processes")
 	}
@@ -214,7 +214,7 @@ func TestWiden(t *testing.T) {
 	dir := fixture(t, false)
 	// Warmup 10s => recorded windows 10..19 (rates 1100..2000). 5s windows => two buckets:
 	// (1100+..+1500)/5 = 1300 ops/s and (1600+..+2000)/5 = 1800 ops/s.
-	out, code := render(t, dir, Options{Warmup: 10 * time.Second, Window: 5 * time.Second})
+	out, code := render(t, dir, Options{Detailed: true, Warmup: 10 * time.Second, Window: 5 * time.Second})
 	if code != 0 {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
@@ -260,16 +260,16 @@ func TestWidenValidation(t *testing.T) {
 		}
 	}
 	// same as recorded size is allowed and equals the default output
-	a, _ := render(t, dir, Options{Window: time.Second})
-	b, _ := render(t, dir, Options{})
+	a, _ := render(t, dir, Options{Detailed: true, Window: time.Second})
+	b, _ := render(t, dir, Options{Detailed: true})
 	if a != b {
 		t.Fatal("--window equal to the recorded window must not change the report")
 	}
 }
 
 func TestWorkerCPUWindowsAndTotals(t *testing.T) {
-	out, _ := render(t, fixture(t, false), Options{Warmup: 10 * time.Second})
-	for _, want := range []string{"Worker CPU: per-window statistics (10 windows of 1s", "Worker CPU: run totals (10s analysed", "source", "system (host)"} {
+	out, _ := render(t, fixture(t, false), Options{Detailed: true, Warmup: 10 * time.Second})
+	for _, want := range []string{"WORKER CPU", "Per-window statistics   10 windows of 1s, cores", "Run totals   10s analysed", "source", "system (host)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q:\n%s", want, out)
 		}
@@ -277,8 +277,8 @@ func TestWorkerCPUWindowsAndTotals(t *testing.T) {
 }
 
 func TestServerWindowsAndTotals(t *testing.T) {
-	out, _ := render(t, fixture(t, false), Options{Warmup: 10 * time.Second})
-	for _, want := range []string{"Server-side KVRGW: per-window statistics (10 windows of 1s", "Server-side KVRGW: run totals (10s analysed", "avg ops/s"} {
+	out, _ := render(t, fixture(t, false), Options{Detailed: true, Warmup: 10 * time.Second})
+	for _, want := range []string{"SERVER-SIDE KVRGW", "Per-window statistics   10 windows of 1s, summed over workers", "Run totals   10s analysed", "avg ops/s"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q:\n%s", want, out)
 		}
@@ -303,8 +303,8 @@ func TestWindowedStatsWarning(t *testing.T) {
 }
 
 func TestFDBPerWindow(t *testing.T) {
-	out, _ := render(t, fixture(t, false), Options{Warmup: 10 * time.Second})
-	if !strings.Contains(out, "FDB cluster: per-window statistics (9 of 10 windows of 1s had samples)") || !strings.Contains(out, "FDB cluster: run totals") {
+	out, _ := render(t, fixture(t, false), Options{Detailed: true, Warmup: 10 * time.Second})
+	if !strings.Contains(out, "FDB CLUSTER") || !strings.Contains(out, "Per-window statistics   9 of 10 windows of 1s had samples") || !strings.Contains(out, "Run totals   10s analysed, 10 samples at ~1s") {
 		t.Fatalf("\n%s", out)
 	}
 }
@@ -337,5 +337,32 @@ func TestWindowsNote(t *testing.T) {
 	s := []sample{{1500, 1}}
 	if !windowHasSample([2]int64{1000, 2000}, s) || windowHasSample([2]int64{2000, 3000}, s) {
 		t.Fatal("windowHasSample")
+	}
+}
+
+func TestNumAbbreviatesMillions(t *testing.T) {
+	for in, want := range map[float64]string{999999: "999,999", 1416580: "1.42M", 2.5e9: "2.50G", -1.5e6: "-1.50M"} {
+		if got := num(in); got != want {
+			t.Fatalf("num(%v) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestDefaultOmitsPerWindowTables(t *testing.T) {
+	dir := fixture(t, false)
+	def, _ := render(t, dir, Options{Warmup: 10 * time.Second})
+	for _, gone := range []string{"Per-window statistics", "errors/win", "retries/win"} {
+		if strings.Contains(def, gone) {
+			t.Fatalf("%q must only appear with --detailed:\n%s", gone, def)
+		}
+	}
+	for _, want := range []string{"CLIENT OPS", "Run totals", "15,500", "WORKER CPU", "SERVER-SIDE KVRGW", "FDB CLUSTER", "FDB BY ROLE"} {
+		if !strings.Contains(def, want) {
+			t.Fatalf("missing %q:\n%s", want, def)
+		}
+	}
+	det, _ := render(t, dir, Options{Warmup: 10 * time.Second, Detailed: true})
+	if strings.Count(det, "Per-window statistics") != 4 {
+		t.Fatalf("expected a per-window table in each of the four sections:\n%s", det)
 	}
 }

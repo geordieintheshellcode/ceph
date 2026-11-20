@@ -29,7 +29,7 @@ commands:
   run-put-object-overwrite-versioned   overwrite and verify version counts
   run-delete-multi                     batch deletes (destructive)
   report <results-dir>                 analyse a results directory
-        [--warmup D] [--window D] [--deviation N] [--per-server]
+        [--warmup D] [--window D] [--detailed] [--deviation N] [--per-server]
 
 global flags:
   --config FILE          harness config (default: ./kvrgw-perf.yaml, else next to the binary)
@@ -204,6 +204,7 @@ func runReport(args []string) int {
 	warmup := fs.String("warmup", "0s", "duration of the benchmark start to ignore")
 	fs.Float64Var(&o.Deviation, "deviation", 10, "percent deviation from the median counted by dev%")
 	fs.BoolVar(&o.PerServer, "per-server", false, "one FDB line per process")
+	fs.BoolVar(&o.Detailed, "detailed", false, "also print per-window statistics (default: run totals only)")
 	window := fs.String("window", "0s", "widen the client-ops windows to this size (multiple of the recorded window)")
 	// Accept flags before or after the results directory.
 	var dir string
@@ -236,5 +237,8 @@ func runReport(args []string) int {
 		return 2
 	}
 	o.Window = wd
+	if wd > 0 {
+		o.Detailed = true // --window only affects the per-window tables
+	}
 	return report.Run(os.Stdout, dir, o)
 }
