@@ -203,12 +203,19 @@ func TestKvrgwYAML(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(p)
-	for _, want := range []string{"tier:", "max_inline: 256", "max_kv_store: 4096", "batch_size: 9", "batch_threads: 8"} {
+	for _, want := range []string{"tier:", "max_inline: 256", "max_kv_store: 4096", "batch_size: 9", "backend_workers: 4"} {
 		if !contains(string(b), want) {
 			t.Errorf("missing %q in\n%s", want, b)
 		}
 	}
-	if env := c.KvrgwEnv(); env[0] != "KVRGW_BATCH_SIZE=9" || len(env) != 3 {
+	if env := c.KvrgwEnv(); env[0] != "KVRGW_BATCH_SIZE=9" || !contains(strings.Join(env, " "), "KVRGW_BACKEND_WORKERS=4") ||
+		!contains(strings.Join(env, " "), "KVRGW_MAX_INFLIGHT_OPS=4096") || contains(strings.Join(env, " "), "KVRGW_BATCH_THREADS") {
+		t.Fatalf("%v", env)
+	}
+	// Deprecated batch_threads is passed through only when backend_workers is unset.
+	old := Defaults()
+	old.Kvrgw.BackendWorkers, old.Kvrgw.BatchThreads = 0, 8
+	if env := strings.Join(old.KvrgwEnv(), " "); !contains(env, "KVRGW_BATCH_THREADS=8") || contains(env, "KVRGW_BACKEND_WORKERS") {
 		t.Fatalf("%v", env)
 	}
 	ov := NewOverrides()
@@ -224,6 +231,52 @@ func TestKvrgwYAML(t *testing.T) {
 	f, _ := ParseFile([]byte("kvrgw:\n  bogus: 1\n"))
 	if _, err := Resolve(f, "load"); err == nil {
 		t.Fatal("unknown kvrgw key must fail")
+	}
+}
+
+func TestDriverModeAndStreams(t *testing.T) {
+	c := Defaults()
+	c.Duration = "1s"
+	c.ThreadsPerWorker = 16
+	if c.Streams() != 16 || c.Generators() != 16 {
+		t.Fatalf("streams default to threads: %d %d", c.Streams(), c.Generators())
+	}
+	c.StreamsPerWorker = 512
+	if c.Streams() != 512 {
+		t.Fatal("streams_per_worker")
+	}
+	c.DriverMode = "bogus"
+	if c.Validate("run-put-object") == nil {
+		t.Fatal("bad driver_mode must fail")
+	}
+	c.DriverMode = "sync"
+	c.RateOpsPerSec = 1000
+	if c.Validate("run-put-object") == nil {
+		t.Fatal("open loop needs async")
+	}
+	c.DriverMode = "async"
+	if err := c.Validate("run-put-object"); err != nil {
+		t.Fatal(err)
+	}
+	if c.Validate("run-list-objects") == nil {
+		t.Fatal("open loop list-objects must fail")
+	}
+	if c.Generators() != c.DriverThreads {
+		t.Fatal("open loop: one generator per driver thread")
+	}
+	b, _ := c.WorkerJSON()
+	for _, want := range []string{`"driver_mode":"async"`, `"streams_per_worker":512`, `"driver_threads":2`, `"rate_ops_per_sec":1000`} {
+		if !contains(string(b), want) {
+			t.Fatalf("%s missing %s", b, want)
+		}
+	}
+	ov := NewOverrides()
+	ov.vals["streams_per_worker"] = "64"
+	ov.vals["driver_mode"] = "sync"
+	ov.vals["rate_ops_per_sec"] = "0"
+	ov.vals["max_inflight_ops"] = "100"
+	if err := ov.Apply(&c); err != nil || c.Streams() != 64 || c.DriverMode != "sync" || c.Kvrgw.MaxInflightOps != 100 {
+		t.Fatalf("%v %+v", err, c)
 	}
 }
 
@@ -271,5 +324,69 @@ func TestBucketRangeAndVersionedPrompt(t *testing.T) {
 		"Continue? [y/N] "
 	if got := c.VersionedOverwritePrompt(); got != want {
 		t.Fatalf("prompt:\n%q\nwant:\n%q", got, want)
+	}
+}
+
+func TestRampConfig(t *testing.T) {
+	c := Defaults()
+	c.Ramp = true
+	if err := c.Validate("run-put-object"); err == nil || !contains(err.Error(), "ramp_start_rate") {
+		t.Fatalf("start rate required: %v", err)
+	}
+	c.RampStartRate = 2000
+	if err := c.Validate("run-put-object"); err != nil {
+		t.Fatalf("ramp without ops/duration: %v", err)
+	}
+	if err := c.Validate("run-list-objects"); err == nil {
+		t.Fatal("ramp is run-put-* only")
+	}
+	c.Ops = 10
+	if err := c.Validate("run-put-object"); err == nil {
+		t.Fatal("ops not allowed with ramp")
+	}
+	c.Ops = 0
+	c.RampMaxRate = 1000
+	if err := c.Validate("run-put-object"); err == nil {
+		t.Fatal("max below start")
+	}
+	c.RampMaxRate = 0
+	c.Arrival = "bursty"
+	if err := c.Validate("run-put-object"); err == nil {
+		t.Fatal("bad arrival")
+	}
+	c.Arrival = "poisson"
+	c.WorkerCount = 4
+	c.Duration = "12h"
+	w := c.ApplyCommandRules("run-put-object")
+	if c.DriverMode != "async" || c.RateOpsPerSec != 500 || len(w) != 2 || !c.OpenLoop() || c.Duration != "" {
+		t.Fatalf("rules (async, rate, duration ignored): %+v %v", c, w)
+	}
+	if c.RampMinAchieved() != 99 {
+		t.Fatal("sla default")
+	}
+	c.RampMode = "throughput"
+	if c.RampMinAchieved() != 98 || !c.RampThroughputOnly() {
+		t.Fatal("throughput default")
+	}
+	c.RampMinAchievedPct = 95
+	if c.RampMinAchieved() != 95 {
+		t.Fatal("explicit")
+	}
+	c.RampMode = "bogus"
+	if c.Validate("run-put-object") == nil {
+		t.Fatal("bad ramp_mode")
+	}
+	c.RampMode = "sla"
+	b, _ := c.WorkerJSON()
+	if !contains(string(b), `"arrival":"poisson"`) || !contains(string(b), `"rate_ops_per_sec":500`) {
+		t.Fatalf("%s", b)
+	}
+	ov := NewOverrides()
+	ov.vals["ramp"] = "true"
+	ov.vals["ramp_start_rate"] = "1500.5"
+	ov.vals["ramp_max_p99_ms"] = "20"
+	c2 := Defaults()
+	if err := ov.Apply(&c2); err != nil || !c2.Ramp || c2.RampStartRate != 1500.5 || c2.RampMaxP99Ms != 20 {
+		t.Fatalf("%v %+v", err, c2)
 	}
 }

@@ -37,9 +37,39 @@ type Config struct {
 	ObjectSizeBytes  uint64 `yaml:"object_size_bytes" json:"object_size_bytes"`
 	WorkerCount      int    `yaml:"worker_count" json:"worker_count"`
 	ThreadsPerWorker int    `yaml:"threads_per_worker" json:"threads_per_worker"`
-	VerifyThreads    int    `yaml:"verify_threads" json:"verify_threads"`
-	TenantName       string `yaml:"tenant_name" json:"tenant_name"`
-	ReportIntervalMs int64  `yaml:"report_interval_ms" json:"report_interval_ms"`
+	// DriverMode is the worker's client model: "sync" (one blocking thread per stream,
+	// calling the sync API) or "async" (streams are coroutines on DriverThreads executors
+	// calling the _a ops).
+	DriverMode string `yaml:"driver_mode" json:"driver_mode"`
+	// StreamsPerWorker is the closed-loop concurrency per worker; 0 means ThreadsPerWorker.
+	StreamsPerWorker int `yaml:"streams_per_worker" json:"streams_per_worker"`
+	DriverThreads    int `yaml:"driver_threads" json:"driver_threads"`
+	// RateOpsPerSec > 0 switches the run-* command to open loop at this per-worker rate
+	// (async mode only); latency is measured from each op's scheduled send time.
+	RateOpsPerSec float64 `yaml:"rate_ops_per_sec" json:"rate_ops_per_sec"`
+	// Arrival is the open-loop inter-arrival distribution: "constant" or "poisson".
+	Arrival string `yaml:"arrival" json:"arrival"`
+
+	// Ramp (--ramp, run-put-* only): an open-loop run whose target steps up linearly
+	// (cluster totals) until a step fails its criteria; see perf/RAMP.md.
+	Ramp bool `yaml:"ramp" json:"ramp"`
+	// RampMode: "sla" judges steps on latency, misses, errors, backlog and throughput;
+	// "throughput" only on throughput (and errors): it ramps until a step completes
+	// less than ramp_min_achieved_pct of its target.
+	RampMode                string  `yaml:"ramp_mode" json:"ramp_mode"`
+	RampStartRate           float64 `yaml:"ramp_start_rate" json:"ramp_start_rate"`
+	RampStepRate            float64 `yaml:"ramp_step_rate" json:"ramp_step_rate"` // 0 = ramp_start_rate
+	RampMaxRate             float64 `yaml:"ramp_max_rate" json:"ramp_max_rate"`   // 0 = none
+	RampWarmup              string  `yaml:"ramp_warmup" json:"ramp_warmup"`
+	RampMeasure             string  `yaml:"ramp_measure" json:"ramp_measure"`
+	RampMaxP99Ms            float64 `yaml:"ramp_max_p99_ms" json:"ramp_max_p99_ms"`
+	RampMaxMissedPct        float64 `yaml:"ramp_max_missed_pct" json:"ramp_max_missed_pct"`
+	RampMaxErrorPct         float64 `yaml:"ramp_max_error_pct" json:"ramp_max_error_pct"`
+	RampMinAchievedPct      float64 `yaml:"ramp_min_achieved_pct" json:"ramp_min_achieved_pct"`
+	RampMaxBacklogGrowthPct float64 `yaml:"ramp_max_backlog_growth_pct" json:"ramp_max_backlog_growth_pct"`
+	VerifyThreads           int     `yaml:"verify_threads" json:"verify_threads"`
+	TenantName              string  `yaml:"tenant_name" json:"tenant_name"`
+	ReportIntervalMs        int64   `yaml:"report_interval_ms" json:"report_interval_ms"`
 
 	FdbStats            bool   `yaml:"fdb_stats" json:"fdb_stats"`
 	FdbClusterFile      string `yaml:"fdb_cluster_file" json:"fdb_cluster_file"`
@@ -66,14 +96,23 @@ type Config struct {
 	Kvrgw KvrgwConfig `yaml:"-" json:"kvrgw"`
 }
 
-// KvrgwConfig mirrors the `tier:` block of backend/kvrgw.yaml.
+// KvrgwConfig mirrors the `tier:` block of backend/kvrgw.yaml, plus the async runtime
+// knobs (exported as KVRGW_* environment variables by KvrgwEnv).
 type KvrgwConfig struct {
 	MaxInline         uint32 `yaml:"max_inline" json:"max_inline"`
 	MaxKvStore        uint32 `yaml:"max_kv_store" json:"max_kv_store"`
 	KvStoreCoalescing bool   `yaml:"kv_store_coalescing" json:"kv_store_coalescing"`
 	BatchSize         int    `yaml:"batch_size" json:"batch_size"`
 	BatchTimeoutUs    int    `yaml:"batch_timeout_us" json:"batch_timeout_us"`
-	BatchThreads      int    `yaml:"batch_threads" json:"batch_threads"`
+	// BatchThreads is deprecated (backend_workers replaces it). When set and
+	// backend_workers is not, it is exported as KVRGW_BATCH_THREADS, which the runtime reads
+	// as backend_workers with a warning.
+	BatchThreads        int   `yaml:"batch_threads,omitempty" json:"batch_threads,omitempty"`
+	BackendWorkers      int   `yaml:"backend_workers" json:"backend_workers"`
+	MaxInflightOps      int64 `yaml:"max_inflight_ops" json:"max_inflight_ops"`
+	TxnMaxAttempts      int   `yaml:"txn_max_attempts" json:"txn_max_attempts"`
+	BatchTxnMaxAttempts int   `yaml:"batch_txn_max_attempts" json:"batch_txn_max_attempts"`
+	TxnTimeoutMs        int64 `yaml:"txn_timeout_ms" json:"txn_timeout_ms"`
 }
 
 // WriteKvrgwYAML synthesizes the runtime config file the workers read via
@@ -90,15 +129,177 @@ func (c *Config) WriteKvrgwYAML(path string) error {
 	return os.WriteFile(path, append([]byte(hdr), b...), 0o644)
 }
 
-// KvrgwEnv returns the environment overrides that make the batch settings effective.
+// KvrgwEnv returns the environment overrides that make the batch and async runtime
+// settings effective (the yaml loader reads only the tier keys).
 func (c *Config) KvrgwEnv() []string {
 	k := c.Kvrgw
-	return []string{
+	env := []string{
 		fmt.Sprintf("KVRGW_BATCH_SIZE=%d", k.BatchSize),
 		fmt.Sprintf("KVRGW_BATCH_TIMEOUT_US=%d", k.BatchTimeoutUs),
-		fmt.Sprintf("KVRGW_BATCH_THREADS=%d", k.BatchThreads),
 	}
+	switch {
+	case k.BackendWorkers > 0:
+		env = append(env, fmt.Sprintf("KVRGW_BACKEND_WORKERS=%d", k.BackendWorkers))
+	case k.BatchThreads > 0:
+		env = append(env, fmt.Sprintf("KVRGW_BATCH_THREADS=%d", k.BatchThreads))
+	}
+	if k.MaxInflightOps > 0 {
+		env = append(env, fmt.Sprintf("KVRGW_MAX_INFLIGHT_OPS=%d", k.MaxInflightOps))
+	}
+	if k.TxnMaxAttempts > 0 {
+		env = append(env, fmt.Sprintf("KVRGW_TXN_MAX_ATTEMPTS=%d", k.TxnMaxAttempts))
+	}
+	if k.BatchTxnMaxAttempts > 0 {
+		env = append(env, fmt.Sprintf("KVRGW_BATCH_TXN_MAX_ATTEMPTS=%d", k.BatchTxnMaxAttempts))
+	}
+	env = append(env, fmt.Sprintf("KVRGW_TXN_TIMEOUT_MS=%d", k.TxnTimeoutMs))
+	return env
 }
+
+// Streams is the effective closed-loop concurrency per worker (streams_per_worker, or
+// threads_per_worker when that is 0).
+func (c *Config) Streams() int {
+	if c.StreamsPerWorker > 0 {
+		return c.StreamsPerWorker
+	}
+	return c.ThreadsPerWorker
+}
+
+// OpenLoop reports a fixed-rate run (rate_ops_per_sec > 0).
+func (c *Config) OpenLoop() bool { return c.RateOpsPerSec > 0 }
+
+// Generators is the number of key-space generators per worker: the streams in closed
+// loop, one per driver thread in open loop. RunSummary.thread_counts has one entry per
+// generator, and global stream ids run over WorkerCount * Generators().
+func (c *Config) Generators() int {
+	if c.OpenLoop() {
+		return c.DriverThreads
+	}
+	return c.Streams()
+}
+
+// ConcurrencyLabel describes the client model, e.g. "4 x 128 streams (sync)".
+func (c *Config) ConcurrencyLabel() string {
+	if c.DriverMode == "async" {
+		s := fmt.Sprintf("%d workers x %d streams on %d driver threads (async)", c.WorkerCount, c.Streams(), c.DriverThreads)
+		if c.OpenLoop() {
+			s = fmt.Sprintf("%d workers x %d driver threads, open loop at %g ops/s per worker (async)",
+				c.WorkerCount, c.DriverThreads, c.RateOpsPerSec)
+		}
+		return s
+	}
+	return fmt.Sprintf("%d workers x %d streams (sync: one thread each)", c.WorkerCount, c.Streams())
+}
+
+// RampCommands are the commands that support --ramp.
+var RampCommands = []string{"run-put-object", "run-put-object-overwrite", "run-put-object-overwrite-versioned"}
+
+// RampThroughputOnly reports ramp_mode throughput (latency, misses and backlog are
+// not failure criteria).
+func (c *Config) RampThroughputOnly() bool { return c.RampMode == "throughput" }
+
+// RampMinAchieved is ramp_min_achieved_pct, or its mode default when 0: 99% for
+// sla, 98% for throughput.
+func (c *Config) RampMinAchieved() float64 {
+	if c.RampMinAchievedPct > 0 {
+		return c.RampMinAchievedPct
+	}
+	if c.RampThroughputOnly() {
+		return 98
+	}
+	return 99
+}
+
+// InflightCap is the most async ops the cluster can have in flight: in open loop
+// each driver may have max_inflight_ops / driver_threads outstanding, in closed loop
+// each worker has at most min(streams, max_inflight_ops) (beyond it, QUEUE_FULL).
+// 0 for sync mode or when max_inflight_ops is unknown.
+func (c *Config) InflightCap() int64 {
+	if c.DriverMode != "async" || c.Kvrgw.MaxInflightOps <= 0 {
+		return 0
+	}
+	per := c.Kvrgw.MaxInflightOps
+	if c.OpenLoop() {
+		g := c.Kvrgw.MaxInflightOps / int64(c.DriverThreads)
+		if g < 1 {
+			g = 1
+		}
+		per = g * int64(c.DriverThreads)
+	} else if s := int64(c.Streams()); s < per {
+		per = s
+	}
+	return per * int64(c.WorkerCount)
+}
+
+// RampStep returns the per-step increment (cluster total, ops/s).
+func (c *Config) RampStep() float64 {
+	if c.RampStepRate > 0 {
+		return c.RampStepRate
+	}
+	return c.RampStartRate
+}
+
+// RampRate returns step i's target (cluster total, ops/s).
+func (c *Config) RampRate(i int) float64 { return c.RampStartRate + float64(i)*c.RampStep() }
+
+// RampDurations parses ramp_warmup and ramp_measure.
+func (c *Config) RampDurations() (warmup, measure time.Duration, err error) {
+	if warmup, err = time.ParseDuration(c.RampWarmup); err != nil {
+		return 0, 0, fmt.Errorf("ramp_warmup: %w", err)
+	}
+	if measure, err = time.ParseDuration(c.RampMeasure); err != nil {
+		return 0, 0, fmt.Errorf("ramp_measure: %w", err)
+	}
+	return warmup, measure, nil
+}
+
+// validateRamp checks the --ramp settings.
+func (c *Config) validateRamp(command string) error {
+	ok := false
+	for _, x := range RampCommands {
+		ok = ok || x == command
+	}
+	if !ok {
+		return fmt.Errorf("--ramp is supported for %v, not %s", RampCommands, command)
+	}
+	if c.RateOpsPerSec > 0 {
+		return fmt.Errorf("--ramp sets the rate itself; drop rate_ops_per_sec")
+	}
+	if c.Ops != 0 {
+		return fmt.Errorf("--ramp runs until a step fails; ops is not allowed")
+	}
+	if c.RampMode != "sla" && c.RampMode != "throughput" {
+		return fmt.Errorf("ramp_mode must be sla or throughput, not %q", c.RampMode)
+	}
+	if c.RampStartRate <= 0 {
+		return fmt.Errorf("--ramp needs ramp_start_rate > 0 (ops/s, cluster total)")
+	}
+	if c.RampStepRate < 0 || c.RampMaxRate < 0 {
+		return fmt.Errorf("ramp_step_rate and ramp_max_rate must be >= 0")
+	}
+	if c.RampMaxRate > 0 && c.RampMaxRate < c.RampStartRate {
+		return fmt.Errorf("ramp_max_rate (%g) is below ramp_start_rate (%g)", c.RampMaxRate, c.RampStartRate)
+	}
+	w, m, err := c.RampDurations()
+	if err != nil {
+		return err
+	}
+	if w < 0 || m <= 0 {
+		return fmt.Errorf("ramp_warmup must be >= 0 and ramp_measure > 0")
+	}
+	if c.ReportIntervalMs <= 0 {
+		return fmt.Errorf("--ramp needs report_interval_ms > 0 (steps are whole report windows)")
+	}
+	if c.RampMaxP99Ms <= 0 || c.RampMaxMissedPct < 0 || c.RampMaxErrorPct < 0 ||
+		c.RampMinAchievedPct < 0 || c.RampMinAchievedPct > 100 || c.RampMaxBacklogGrowthPct < 0 {
+		return fmt.Errorf("ramp criteria out of range (max_p99_ms > 0, pcts >= 0, min_achieved_pct in [0,100])")
+	}
+	return nil
+}
+
+// OpenLoopCommands are the commands that support rate_ops_per_sec.
+var OpenLoopCommands = []string{"run-put-object", "run-put-object-overwrite",
+	"run-put-object-overwrite-versioned", "run-delete-multi"}
 
 // Defaults returns the built-in defaults. perf/kvrgw-perf.yaml lists the same values
 // explicitly (a test keeps the two in sync).
@@ -106,12 +307,16 @@ func Defaults() Config {
 	return Config{
 		NumObjects: 1000000, NumBuckets: 10, BucketNamePrefix: "rgwkv",
 		PaddingBytes: 16, ObjectSizeBytes: 8192, WorkerCount: 1, ThreadsPerWorker: 1,
+		DriverMode: "sync", StreamsPerWorker: 0, DriverThreads: 2, RateOpsPerSec: 0, Arrival: "constant",
+		RampWarmup: "30s", RampMeasure: "60s", RampMaxP99Ms: 50, RampMaxMissedPct: 0.1,
+		RampMaxErrorPct: 0.1, RampMinAchievedPct: 0, RampMaxBacklogGrowthPct: 50, RampMode: "sla",
 		VerifyThreads: 4, TenantName: envOr("KVRGW_TENANT_NAME", "kv-poc"),
 		ReportIntervalMs: 1000,
 		FdbStats:         true, FdbClusterFile: os.Getenv("FDB_CLUSTER_FILE"), FdbcliPath: "/opt/foundationdb/usr/bin/fdbcli",
 		FdbSampleIntervalMs: 5000, CpuSampleIntervalMs: 1000,
 		PageSize: 1000,
-		Kvrgw:    KvrgwConfig{MaxInline: 256, MaxKvStore: 4096, BatchSize: 5, BatchTimeoutUs: 1000, BatchThreads: 8},
+		Kvrgw: KvrgwConfig{MaxInline: 256, MaxKvStore: 4096, BatchSize: 5, BatchTimeoutUs: 1000,
+			BackendWorkers: 4, MaxInflightOps: 4096, TxnMaxAttempts: 3, BatchTxnMaxAttempts: 10},
 	}
 }
 
@@ -243,8 +448,40 @@ func (c *Config) Validate(command string) error {
 	if c.WorkerCount < 1 || c.ThreadsPerWorker < 1 {
 		return fmt.Errorf("worker_count and threads_per_worker must be >= 1")
 	}
-	if c.WorkerCount*c.ThreadsPerWorker > 65536 {
-		return fmt.Errorf("worker_count * threads_per_worker must be <= 65536")
+	if c.StreamsPerWorker < 0 {
+		return fmt.Errorf("streams_per_worker must be >= 0 (0 = threads_per_worker)")
+	}
+	if c.Arrival != "constant" && c.Arrival != "poisson" {
+		return fmt.Errorf("arrival must be constant or poisson, not %q", c.Arrival)
+	}
+	if c.Ramp {
+		if err := c.validateRamp(command); err != nil {
+			return err
+		}
+	}
+	if c.DriverMode != "sync" && c.DriverMode != "async" {
+		return fmt.Errorf("driver_mode must be sync or async, not %q", c.DriverMode)
+	}
+	if c.DriverThreads < 1 {
+		return fmt.Errorf("driver_threads must be >= 1")
+	}
+	if c.RateOpsPerSec < 0 {
+		return fmt.Errorf("rate_ops_per_sec must be >= 0")
+	}
+	if c.OpenLoop() && !c.Ramp {
+		if c.DriverMode != "async" {
+			return fmt.Errorf("rate_ops_per_sec (open loop) requires driver_mode: async")
+		}
+		ok := false
+		for _, x := range OpenLoopCommands {
+			ok = ok || x == command
+		}
+		if !ok {
+			return fmt.Errorf("open loop (rate_ops_per_sec) is not supported for %s (supported: %v)", command, OpenLoopCommands)
+		}
+	}
+	if c.WorkerCount*c.Generators() > 65536 {
+		return fmt.Errorf("worker_count * streams_per_worker must be <= 65536")
 	}
 	if c.VerifyThreads < 1 {
 		return fmt.Errorf("verify_threads must be >= 1")
@@ -269,7 +506,7 @@ func (c *Config) Validate(command string) error {
 		if c.Ops != 0 || d != 0 {
 			return fmt.Errorf("ops/duration are not valid for load")
 		}
-	} else {
+	} else if !c.Ramp {
 		if (c.Ops != 0) == (d != 0) {
 			return fmt.Errorf("%s requires exactly one of --ops or --duration", command)
 		}
@@ -310,10 +547,25 @@ func (c *Config) VersionedOverwritePrompt() string {
 // ApplyCommandRules adjusts the config for command-specific semantics. It returns
 // human-readable warnings.
 func (c *Config) ApplyCommandRules(command string) (warnings []string) {
+	if c.Ramp {
+		// A ramp is an open-loop async run; the first step's rate is split evenly
+		// across the workers, later steps arrive as RunControl.set_rate.
+		if c.DriverMode != "async" {
+			warnings = append(warnings, "--ramp runs in driver_mode async")
+		}
+		c.DriverMode = "async"
+		c.RateOpsPerSec = c.RampStartRate / float64(c.WorkerCount)
+		// The ramp runs until a step fails (or ramp_max_rate); duration, often
+		// set per command in the config file, does not apply.
+		if c.Duration != "" {
+			warnings = append(warnings, fmt.Sprintf("--ramp ignores duration (%s)", c.Duration))
+			c.Duration = ""
+		}
+	}
 	switch command {
 	case "run-list-objects":
 		if c.SingleThreadMode {
-			c.WorkerCount, c.ThreadsPerWorker = 1, 1
+			c.WorkerCount, c.ThreadsPerWorker, c.StreamsPerWorker = 1, 1, 1
 		} else if uint64(c.WorkerCount) > c.NumBuckets {
 			warnings = append(warnings, fmt.Sprintf(
 				"num_buckets (%d) < worker_count (%d): capping worker_count at %d so every worker owns a bucket",
@@ -322,7 +574,7 @@ func (c *Config) ApplyCommandRules(command string) (warnings []string) {
 		}
 	case "run-delete-multi":
 		if c.SingleThreadMode {
-			c.WorkerCount, c.ThreadsPerWorker = 1, 1
+			c.WorkerCount, c.ThreadsPerWorker, c.StreamsPerWorker = 1, 1, 1
 		}
 	}
 	return
@@ -330,21 +582,27 @@ func (c *Config) ApplyCommandRules(command string) (warnings []string) {
 
 // workerJSON is what workers receive (no collector keys).
 type workerJSON struct {
-	NumObjects            uint64 `json:"num_objects"`
-	NumBuckets            uint64 `json:"num_buckets"`
-	BucketNamePrefix      string `json:"bucket_name_prefix"`
-	PaddingBytes          int    `json:"padding_bytes"`
-	ObjectSizeBytes       uint64 `json:"object_size_bytes"`
-	ThreadsPerWorker      int    `json:"threads_per_worker"`
-	VerifyThreads         int    `json:"verify_threads"`
-	TenantName            string `json:"tenant_name"`
-	ReportIntervalMs      int64  `json:"report_interval_ms"`
-	Ops                   uint64 `json:"ops,omitempty"`
-	DurationMs            int64  `json:"duration_ms,omitempty"`
-	PageSize              int    `json:"page_size"`
-	SingleThreadMode      bool   `json:"single_thread_mode"`
-	NumObjectsToOverwrite uint64 `json:"num_objects_to_overwrite"`
-	Force                 bool   `json:"force"`
+	NumObjects            uint64  `json:"num_objects"`
+	NumBuckets            uint64  `json:"num_buckets"`
+	BucketNamePrefix      string  `json:"bucket_name_prefix"`
+	PaddingBytes          int     `json:"padding_bytes"`
+	ObjectSizeBytes       uint64  `json:"object_size_bytes"`
+	ThreadsPerWorker      int     `json:"threads_per_worker"`
+	DriverMode            string  `json:"driver_mode"`
+	StreamsPerWorker      int     `json:"streams_per_worker"`
+	DriverThreads         int     `json:"driver_threads"`
+	RateOpsPerSec         float64 `json:"rate_ops_per_sec"`
+	Arrival               string  `json:"arrival"`
+	Ramp                  bool    `json:"ramp,omitempty"`
+	VerifyThreads         int     `json:"verify_threads"`
+	TenantName            string  `json:"tenant_name"`
+	ReportIntervalMs      int64   `json:"report_interval_ms"`
+	Ops                   uint64  `json:"ops,omitempty"`
+	DurationMs            int64   `json:"duration_ms,omitempty"`
+	PageSize              int     `json:"page_size"`
+	SingleThreadMode      bool    `json:"single_thread_mode"`
+	NumObjectsToOverwrite uint64  `json:"num_objects_to_overwrite"`
+	Force                 bool    `json:"force"`
 }
 
 // WorkerJSON renders the config sent in InitRequest.config_json.
@@ -355,7 +613,8 @@ func (c *Config) WorkerJSON() ([]byte, error) {
 	}
 	return json.Marshal(workerJSON{
 		c.NumObjects, c.NumBuckets, c.BucketNamePrefix, c.PaddingBytes, c.ObjectSizeBytes,
-		c.ThreadsPerWorker, c.VerifyThreads, c.TenantName,
+		c.ThreadsPerWorker, c.DriverMode, c.Streams(), c.DriverThreads, c.RateOpsPerSec, c.Arrival, c.Ramp,
+		c.VerifyThreads, c.TenantName,
 		c.ReportIntervalMs, c.Ops, d.Milliseconds(), c.PageSize,
 		c.SingleThreadMode, c.NumObjectsToOverwrite, c.Force,
 	})

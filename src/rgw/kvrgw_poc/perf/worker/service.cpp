@@ -1,14 +1,24 @@
 #include "service.hpp"
 
+#include "arrival.hpp"
+
+#include "async/executor.hpp"
+#include "async/task.hpp"
 #include "error_codes.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <optional>
+#include <random>
+#include <coroutine>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 using perf::v1::PhaseEvent;
 
@@ -36,9 +46,119 @@ void fill_stats(const StatsArray &a, google::protobuf::RepeatedPtrField<perf::v1
     o->set_count(m.count);
     o->set_errors(m.errors);
     o->set_sum_micros(m.sum_micros);
+    o->set_queue_full(m.queue_full);
+    o->set_missed(m.missed);
     for (const auto &[code, n] : m.error_codes) (*o->mutable_error_codes())[code] = n;
     if (!metric_is_counter(static_cast<Metric>(i))) fill_hist(m, o->mutable_latency());
   }
+}
+
+// Runs one stream to completion, then reports it done. A free function so the
+// coroutine holds only references whose owners outlive it.
+kvrgw::async::Task<void> stream_main(RunContext &ctx, Operation &op, Stream &s,
+                                     const std::function<void()> &on_done)
+{
+  try {
+    co_await op.run_stream(ctx, s);
+  } catch (const std::exception &e) {
+    ctx.fail(std::string("stream exception: ") + e.what());
+  }
+  on_done();
+}
+
+// ---- open loop ------------------------------------------------------------
+
+// Ops a generator has issued and not yet seen finish, with the generator
+// waiting for them to drain. Touched only on the generator's driver thread.
+struct Outstanding {
+  int64_t n = 0;
+  std::coroutine_handle<> drain_waiter{};
+  struct DrainAwait {
+    Outstanding *o;
+    bool await_ready() const noexcept { return o->n == 0; }
+    void await_suspend(std::coroutine_handle<> h) noexcept { o->drain_waiter = h; }
+    void await_resume() const noexcept {}
+  };
+  DrainAwait drained() { return DrainAwait{this}; }
+};
+
+kvrgw::async::Task<void> open_loop_one(RunContext &ctx, Operation &op, Stream &g, uint64_t i,
+                                       SteadyClock::time_point sched, Outstanding &out)
+{
+  const auto sent = SteadyClock::now();
+  try {
+    co_await op.open_loop_op(ctx, g, i, sched);
+  } catch (const std::exception &e) {
+    ctx.fail(std::string("open loop op exception: ") + e.what());
+  }
+  // Service time: from leaving the driver to completion (retries included).
+  g.ts->record(Metric::ServiceTime, static_cast<uint64_t>(elapsed_us(sent)));
+  ctx.outstanding.fetch_sub(1, std::memory_order_relaxed);
+  if (--out.n == 0 && out.drain_waiter) {
+    std::exchange(out.drain_waiter, {}).resume();
+  }
+}
+
+// One generator: issues its ops on the arrival schedule (constant: op k at
+// anchor + (k*D + driver) / rate; poisson: exponential gaps), on its driver's
+// timerfd. When it wakes late it issues every op that is due at once; their
+// latency still counts from their scheduled times. At most max_outstanding ops
+// are in flight; ops due beyond that are not issued and are counted as missed.
+// RunControl.set_rate re-anchors the schedule at the change's effective time.
+kvrgw::async::Task<void> open_loop_generator(RunContext &ctx, Operation &op, Stream &g,
+                                             const std::function<void()> &on_done)
+{
+  const int D = ctx.cfg.driver_threads;
+  const int64_t max_outstanding =
+      std::max<int64_t>(1, ctx.svc->async_config().max_inflight_ops / D);
+  const Metric metric = ctx.cfg.operation == "run-delete-multi" ? Metric::DeleteMulti : Metric::PutObject;
+  ArrivalSchedule sched_of(ctx.cfg.arrival == "poisson", D, g.driver,
+                           splitmix64_mix(static_cast<uint64_t>(ctx.run_start_unix_s) * 1000003ull + g.gsid));
+  sched_of.reset(ctx.start_tp, ctx.cfg.rate_ops_per_sec);
+  size_t applied = 0;  // rate changes already applied
+  // The next rate change not yet applied, if any.
+  auto pending = [&]() -> std::optional<RunContext::RateChange> {
+    std::lock_guard<std::mutex> lk(ctx.rate_mu);
+    if (applied < ctx.rate_changes.size()) return ctx.rate_changes[applied];
+    return std::nullopt;
+  };
+  Outstanding out;
+  uint64_t issued = 0;
+  bool more = true;
+  while (more && !ctx.stopped() && !ctx.expired()) {
+    auto change = pending();
+    if (change && change->at <= sched_of.next()) {
+      sched_of.reset(change->at, change->rate);
+      ++applied;
+      continue;
+    }
+    co_await g.exec->sleep_until(sched_of.next());
+    const auto now = SteadyClock::now();
+    uint64_t missed = 0;
+    // Issue every op that is due (up to a rate change, which re-anchors).
+    for (auto sched = sched_of.next(); sched <= now; sched_of.advance(), sched = sched_of.next()) {
+      if (change && change->at <= sched) break;
+      if (ctx.stopped() || ctx.expired() || !op.open_loop_more(ctx, g, issued)) {
+        more = false;
+        break;
+      }
+      if (out.n >= max_outstanding) {
+        ++missed;
+        continue;
+      }
+      ++out.n;
+      ctx.outstanding.fetch_add(1, std::memory_order_relaxed);
+      ++issued;
+      // Send lag: how late this op starts relative to its slot (late wake-ups,
+      // and the preparation of earlier ops in the same burst).
+      g.ts->record(Metric::SendLag, static_cast<uint64_t>(elapsed_us(sched)));
+      kvrgw::async::spawn_inline(open_loop_one(ctx, op, g, issued - 1, sched, out));
+    }
+    if (missed > 0) g.ts->add_missed(metric, missed);
+  }
+  co_await out.drained();
+  op.open_loop_done(ctx, g, issued);
+  on_done();
 }
 
 int64_t sys_now_ns()
@@ -50,8 +170,27 @@ int64_t sys_now_ns()
 
 }  // namespace
 
-void WorkerService::fill_server_stats(perf::v1::ServerStats *out)
+void WorkerService::fill_server_stats(
+    perf::v1::ServerStats *out, std::vector<std::unique_ptr<kvrgw::async::ExecutorThread>> *drivers)
 {
+  for (const auto &t : rt_.thread_usage()) {
+    auto *o = out->add_threads();
+    o->set_name(t.name);
+    o->set_group(t.group);
+    o->set_cpu_ns(t.cpu_ns);
+    o->set_wall_ns(t.wall_ns);
+  }
+  if (drivers) {
+    for (auto &d : *drivers) {
+      const auto u = d->cpu_usage();
+      auto *o = out->add_threads();
+      o->set_name(d->name());
+      o->set_group("driver");
+      o->set_cpu_ns(u.cpu_ns);
+      o->set_wall_ns(u.wall_ns);
+    }
+  }
+  out->set_fdb_network_busyness(rt_.fdb_network_busyness());
   auto &svc = rt_.service();
   auto &ls = svc.latency_stats();
   for (int i = 0; i < static_cast<int>(kvrgw::OpType::kCount); ++i) {
@@ -76,6 +215,13 @@ void WorkerService::fill_server_stats(perf::v1::ServerStats *out)
   out->set_batch_conflict_pushbacks(static_cast<uint64_t>(bs.conflict_pushbacks.load()));
   out->set_txn_retries(static_cast<uint64_t>(ls.txn_retries.load()));
   out->set_txn_hard_failures(static_cast<uint64_t>(ls.txn_hard_failures.load()));
+  auto &as = svc.async_stats();
+  out->set_queue_full_rejects(as.queue_full_rejects.load(std::memory_order_relaxed));
+  out->set_inflight_ops_peak(
+      static_cast<uint64_t>(as.inflight_ops_peak.load(std::memory_order_relaxed)));
+  auto &fp = kvrgw::async::frame_pool_counters();
+  out->set_frames_heap_fallback(fp.frames_heap_fallback.load(std::memory_order_relaxed));
+  out->set_max_frame_size(fp.max_frame_size.load(std::memory_order_relaxed));
   auto &es = svc.error_stats();
   for (int i = 0; i < kvrgw::KvrgwErrorCode_ARRAYSIZE; ++i) {
     auto c = es.counts[i].load(std::memory_order_relaxed);
@@ -132,9 +278,14 @@ std::string WorkerService::do_init(const perf::v1::InitRequest &req)
   for (size_t i = 0; i < ctx->payload.size(); ++i) {
     ctx->payload[i] = static_cast<char>(splitmix64_next(st));
   }
-  stats_ = std::make_unique<StatsHub>(cfg.threads_per_worker);
+  // One ThreadStats per benchmark thread: a stream's thread in sync mode, a
+  // driver thread in async mode (shared by that driver's streams).
+  stats_ = std::make_unique<StatsHub>(cfg.async_mode() ? cfg.driver_threads : cfg.streams());
   ctx->stats = stats_.get();
 
+  if (cfg.open_loop() && !op->supports_open_loop()) {
+    return "open loop (rate_ops_per_sec) is not supported for " + req.operation();
+  }
   if (auto err = op->init(*ctx); !err.empty()) return err;
   ctx_ = std::move(ctx);
   op_ = std::move(op);
@@ -175,7 +326,9 @@ grpc::Status WorkerService::RunBenchmark(
     return grpc::Status::OK;
   }
   RunContext &ctx = *ctx_;
-  const int T = ctx.cfg.threads_per_worker;
+  const bool async_mode = ctx.cfg.async_mode();
+  // Units that report completion: streams (one thread each in sync mode).
+  const int T = ctx.cfg.streams();
   const int64_t interval_ms = first.report_interval_ms();
   const int64_t run_start_ns = first.run_start_unix_ns();
   ctx.bench_start_unix_s = run_start_ns / 1000000000;
@@ -187,28 +340,77 @@ grpc::Status WorkerService::RunBenchmark(
 
   // Reader thread: watches for Cancel until the client half-closes.
   std::thread reader([&]() {
+    kvrgw::async::set_thread_name("perf-cancel-rd");
     perf::v1::RunControl m;
     while (s->Read(&m)) {
       if (m.has_cancel()) ctx.cancel = true;
+      if (m.has_set_rate()) {
+        // Map the controller's wall-clock boundary onto the steady clock, as
+        // for the start time.
+        const auto &sr = m.set_rate();
+        RunContext::RateChange c;
+        c.step = sr.step();
+        c.rate = sr.rate_ops_per_sec();
+        c.at = SteadyClock::now() + std::chrono::nanoseconds(sr.effective_at_unix_ns() - sys_now_ns());
+        if (c.rate > 0) {
+          std::lock_guard<std::mutex> lk(ctx.rate_mu);
+          ctx.rate_changes.push_back(c);
+        }
+      }
     }
   });
 
   std::mutex done_mu;
   std::condition_variable done_cv;
   std::atomic<int> finished{0};
+  const std::function<void()> on_done = [&]() {
+    if (++finished == T) {
+      std::lock_guard<std::mutex> g(done_mu);
+      done_cv.notify_all();
+    }
+  };
   std::vector<std::thread> threads;
-  for (int t = 0; t < T; ++t) {
-    threads.emplace_back([&, t]() {
-      try {
-        op_->run_thread(ctx, t);
-      } catch (const std::exception &e) {
-        ctx.fail(std::string("worker thread exception: ") + e.what());
+  std::vector<std::unique_ptr<kvrgw::async::ExecutorThread>> drivers;
+  std::vector<Stream> streams;
+  if (!async_mode) {
+    // Sync mode: one blocking thread per stream, calling the sync wrappers.
+    for (int t = 0; t < T; ++t) {
+      threads.emplace_back([&, t]() {
+        kvrgw::async::set_thread_name("perf-sync-" + std::to_string(t));
+        try {
+          op_->run_thread(ctx, t);
+        } catch (const std::exception &e) {
+          ctx.fail(std::string("worker thread exception: ") + e.what());
+        }
+        on_done();
+      });
+    }
+  } else {
+    // Async mode: driver_threads executors; stream sid runs on driver sid % D.
+    const int D = ctx.cfg.driver_threads;
+    for (int d = 0; d < D; ++d) {
+      drivers.push_back(std::make_unique<kvrgw::async::ExecutorThread>("perf-drv-" + std::to_string(d)));
+      drivers.back()->start();
+    }
+    streams.resize(static_cast<size_t>(T));
+    for (int sid = 0; sid < T; ++sid) {
+      Stream &st = streams[static_cast<size_t>(sid)];
+      st.sid = sid;
+      st.gsid = ctx.gsid(sid);
+      st.driver = sid % D;
+      st.ts = &stats_->thread(st.driver);
+      st.exec = &drivers[static_cast<size_t>(st.driver)]->executor();
+    }
+    // Sleep until the synchronised start (no polling), then start every stream
+    // (in open loop: one generator per driver, which keeps its own schedule).
+    std::this_thread::sleep_until(ctx.start_tp);
+    for (auto &st : streams) {
+      if (ctx.cfg.open_loop()) {
+        kvrgw::async::spawn(*st.exec, open_loop_generator(ctx, *op_, st, on_done));
+      } else {
+        kvrgw::async::spawn(*st.exec, stream_main(ctx, *op_, st, on_done));
       }
-      if (++finished == T) {
-        std::lock_guard<std::mutex> g(done_mu);
-        done_cv.notify_all();
-      }
-    });
+    }
   }
 
   auto emit_progress = [&](int64_t window, int64_t dur_ns) {
@@ -223,7 +425,20 @@ grpc::Status WorkerService::RunBenchmark(
     fill_stats(stats_->cumulative(), p->mutable_cumulative_stats());
     for (const auto &[code, text] : error_texts()) (*p->mutable_error_descriptions())[code] = text;
     p->set_cumulative_as_of_unix_ns(sys_now_ns());
-    fill_server_stats(p->mutable_server_stats());
+    if (ctx.cfg.open_loop()) {
+      double rate = ctx.cfg.rate_ops_per_sec;
+      {
+        // The rate in force now (the latest change already effective).
+        std::lock_guard<std::mutex> lk(ctx.rate_mu);
+        const auto now = SteadyClock::now();
+        for (const auto &c : ctx.rate_changes) {
+          if (c.at <= now) rate = c.rate;
+        }
+      }
+      p->set_target_rate(rate);
+      p->set_outstanding(static_cast<uint64_t>(std::max<int64_t>(0, ctx.outstanding.load())));
+    }
+    fill_server_stats(p->mutable_server_stats(), &drivers);
     s->Write(ev);
   };
 
@@ -257,6 +472,8 @@ grpc::Status WorkerService::RunBenchmark(
     emit_progress(0, dur);
   }
   for (auto &t : threads) t.join();
+  // Every stream has finished: the driver executors are idle.
+  for (auto &d : drivers) d->stop_and_join();
 
   PhaseEvent done;
   done.set_state(PhaseEvent::DONE);
@@ -291,6 +508,7 @@ grpc::Status WorkerService::Verify(grpc::ServerContext *, const perf::v1::Verify
     std::mutex done_mu;
     std::condition_variable done_cv;
     std::thread vt([&] {
+      kvrgw::async::set_thread_name("perf-verify");
       try {
         err = op_->verify(*ctx_, counts, &rep);
       } catch (const std::exception &e) {

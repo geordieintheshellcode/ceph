@@ -51,6 +51,10 @@ enum KvrgwErrorCode : int32_t {
   KVRGW_ERR_VALUE_TOO_LARGE = 403,
   KVRGW_ERR_TRANSACTION_CONFLICT = 404,
   KVRGW_ERR_MAX_RETRIES_EXCEEDED = 405,
+  // The async in-flight op limit (max_inflight_ops) was reached; nothing was
+  // done. Retriable by the caller after a backoff; is_retriable() stays false
+  // because it is not an FDB retry.
+  KVRGW_ERR_QUEUE_FULL = 406,
   KVRGW_ERR_NO_SUCH_UPLOAD = 500,
   KVRGW_ERR_INVALID_PART = 501,
   KVRGW_ERR_INVALID_PART_ORDER = 502,
@@ -105,6 +109,23 @@ inline KvrgwErrorCode fdb_to_error(fdb_error_t err) {
     case fdb::kValueTooLarge:         return KVRGW_ERR_FDB_VALUE_TOO_LARGE;
     case fdb::kTransactionTooLarge:   return KVRGW_ERR_FDB_TRANSACTION_TOO_LARGE;
     default:                          return KVRGW_ERR_INTERNAL;
+  }
+}
+
+// Inverse of fdb_to_error for the FDB-derived codes; 0 for every other code.
+// Lets a coroutine that got a mapped read error hand the FDB code to on_error.
+inline fdb_error_t error_to_fdb(KvrgwErrorCode c) {
+  switch (c) {
+    case KVRGW_ERR_FDB_CONFLICT:                return fdb::kConflict;
+    case KVRGW_ERR_FDB_PROCESS_BEHIND:          return fdb::kProcessBehind;
+    case KVRGW_ERR_FDB_FUTURE_VERSION:          return fdb::kFutureVersion;
+    case KVRGW_ERR_FDB_TRANSACTION_TOO_OLD:     return fdb::kTransactionTooOld;
+    case KVRGW_ERR_FDB_COMMIT_UNKNOWN:          return fdb::kCommitUnknownResult;
+    case KVRGW_ERR_FDB_CLUSTER_VERSION_CHANGED: return fdb::kClusterVersionChanged;
+    case KVRGW_ERR_FDB_KEY_TOO_LARGE:           return fdb::kKeyTooLarge;
+    case KVRGW_ERR_FDB_VALUE_TOO_LARGE:         return fdb::kValueTooLarge;
+    case KVRGW_ERR_FDB_TRANSACTION_TOO_LARGE:   return fdb::kTransactionTooLarge;
+    default:                                    return 0;
   }
 }
 

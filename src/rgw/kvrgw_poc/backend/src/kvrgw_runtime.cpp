@@ -16,6 +16,7 @@
 
 #include "error_codes.hpp"
 #include "fdb.hpp"
+#include "async/executor.hpp"
 #include "gc_policy.hpp"
 
 #include <cstdlib>
@@ -36,6 +37,7 @@ int env_int(const char *name, int default_value)
 
 void run_network()
 {
+  kvrgw::async::set_thread_name("fdb-network");
   if (fdb_error_t err = fdb_run_network()) {
     std::cerr << "fdb_run_network failed: " << fdb_get_error(err) << std::endl;
     std::abort();
@@ -55,6 +57,34 @@ bool KvRgwRuntime::stop_requested() const { return stop_.load(); }
 KvRgwServiceImpl &KvRgwRuntime::service() { return *service_; }
 
 KvStore &KvRgwRuntime::store() { return *store_; }
+
+std::vector<KvRgwRuntime::ThreadUsage> KvRgwRuntime::thread_usage()
+{
+  std::vector<ThreadUsage> out;
+  if (service_) {
+    auto &w = service_->backend_workers();
+    for (int i = 0; i < w.size(); ++i) {
+      const auto u = w.cpu_usage(i);
+      out.push_back({w.name(i), "backend", u.cpu_ns, u.wall_ns});
+    }
+  }
+  if (network_started_ && network_thread_.joinable()) {
+    const auto wall = std::chrono::steady_clock::now() - network_start_tp_;
+    out.push_back({"fdb-network", "fdb-network",
+                   async::thread_cpu_ns(network_thread_.native_handle()),
+                   static_cast<uint64_t>(
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count())});
+  }
+  return out;
+}
+
+double KvRgwRuntime::fdb_network_busyness()
+{
+  if (!store_) {
+    return 0;
+  }
+  return fdb_database_get_main_thread_busyness(store_->database());
+}
 
 PerfDataStore *KvRgwRuntime::perf_data_store()
 {
@@ -177,6 +207,7 @@ bool KvRgwRuntime::start(const KvRgwStartOptions &opts)
               << std::endl;
     return false;
   }
+  network_start_tp_ = std::chrono::steady_clock::now();
   network_thread_ = std::thread(run_network);
   network_started_ = true;
 
@@ -223,14 +254,21 @@ bool KvRgwRuntime::start(const KvRgwStartOptions &opts)
                         &service_->min_part_size());
 
   admin_thread_ = std::thread([this]() {
+    async::set_thread_name("kvrgw-admin");
     if (!admin_server_->run()) {
       std::cerr << "admin server startup failed" << std::endl;
     }
   });
 
   if (!perf_mode_) {
-    sweeper_thread_ = std::thread([this]() { sweeper_->run(); });
-    gc_thread_ = std::thread([this]() { gc_worker_->run(); });
+    sweeper_thread_ = std::thread([this]() {
+      async::set_thread_name("kvrgw-sweeper");
+      sweeper_->run();
+    });
+    gc_thread_ = std::thread([this]() {
+      async::set_thread_name("kvrgw-gc");
+      gc_worker_->run();
+    });
   }
 
   started_ = true;

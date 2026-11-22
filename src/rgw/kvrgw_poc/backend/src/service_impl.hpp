@@ -30,6 +30,7 @@
 #include "kv_store.hpp"
 #include "object_value.hpp"
 #include "ref_tag.hpp"
+#include "service_async.hpp"
 #include "sweeper.hpp"
 #include "tenant_value.hpp"
 #include "typed_ids.hpp"
@@ -65,6 +66,9 @@ struct TierConfig {
   bool kv_store_coalescing{kDefaultKvStoreCoalescing};
   int batch_size{5};
   int batch_timeout_us{1000};
+  // Deprecated and ignored: PUT batches run on the backend workers
+  // (KVRGW_BACKEND_WORKERS). KVRGW_BATCH_THREADS is still read, as an alias
+  // for KVRGW_BACKEND_WORKERS when that is not set.
   int batch_threads{8};
 };
 
@@ -78,11 +82,13 @@ struct BatchPutResult {
   BatchPutResult(KvrgwErrorCode ec, version_id_t vid) : error_code(ec), version_id(vid) {}
 };
 
+// One PUT waiting for a batch. It lives in put_object_a's coroutine frame,
+// which stays suspended until run_batch completes it, so every view below
+// (into the caller's buffers and the frame's own tag/metadata buffers) stays
+// valid. The queue holds pointers; nothing is copied or moved.
 struct BatchCommitEntry {
   tenant_id_t tenant_id;
   bucket_id_t bucket_id{};
-  // Everything below is a view into the caller's buffers: put_object_route
-  // blocks on the future until the entry is done, so they stay alive.
   std::string_view bucket_name;
   std::string_view object_name;
   ObjectValue value;
@@ -93,7 +99,14 @@ struct BatchCommitEntry {
   std::span<const uint8_t> tag_encoded;
   std::span<const uint8_t> metadata_encoded;
   std::chrono::steady_clock::time_point enqueued_at;
-  std::promise<BatchPutResult> promise;
+
+  // Completion: run_batch stores `result`, then posts `waiter` to
+  // `waiter_exec` (or to the completing worker when the waiter has no
+  // executor, i.e. a sync_wait caller).
+  std::coroutine_handle<> waiter{};
+  async::Executor* waiter_exec{nullptr};
+  BatchPutResult result{};
+  async::MpscNode node{};
 };
 
 struct BatchStats {
@@ -145,78 +158,82 @@ struct BatchStats {
   }
 };
 
+// PUT batcher. One queue shared by all backend workers (batches fill W times
+// faster than per-worker queues, and the same-key pushback needs one view).
+//
+//  - submit(): an awaiter; pushes the entry and suspends the PUT.
+//  - When a push brings the queue to batch_size, a "form batch" task is posted
+//    to the next worker (round-robin); it extracts up to batch_size entries and
+//    runs run_batch there. The batch stays pinned to that worker.
+//  - When the queue becomes non-empty, worker 0 arms a timer for
+//    enqueued_at + batch_timeout_us; on expiry it extracts a partial batch and
+//    posts it round-robin.
+//  - No per-thread batch cap: batches in flight are bounded by the in-flight
+//    op limit.
 class BatchCommitQueue {
  public:
   explicit BatchCommitQueue(KvRgwServiceImpl& service);
   ~BatchCommitQueue();
 
-  void start(int num_threads);
+  // Accepting entries again after stop(). The argument is ignored: batches run
+  // on the backend workers (backend_workers replaces batch_threads).
+  void start(int ignored_num_threads = 0);
+  // Completes every queued, unformed entry with KVRGW_ERR_INTERNAL; later
+  // submits fail the same way until start(). Batches already running finish.
   void stop();
-  std::future<BatchPutResult> enqueue(BatchCommitEntry entry);
+  // True when no batcher task (form / timer / run_batch) is alive.
+  bool idle() const noexcept { return tasks_.load(std::memory_order_acquire) == 0; }
   BatchStats& stats() { return stats_; }
 
- private:
-  struct InFlightBatch {
-    enum Phase : uint8_t { PHASE_EMPTY = 0, PHASE_1 = 1, PHASE_2 = 2, PHASE_3 = 3, PHASE_FALLBACK = 4 };
-    enum Step : uint8_t { STEP_WORKING = 0, STEP_COMMIT_ISSUED = 1, STEP_IO_ISSUED = 2 };
-
-    // Worst-case split: 20 storage entries / 2 per Group P:O = 10 keys.
-    static constexpr int kMaxPhase1Keys = kMaxBatchSize / 2; // = 10
-
-    uint8_t phase{PHASE_EMPTY};
-    uint8_t step{STEP_WORKING};
-    uint8_t entry_count{0};
-    uint8_t phase1_key_count{0};
-    uint8_t p3_attempt{0};
-    uint8_t start_attempt{0};
-
-    std::array<KeyBuf, kMaxPhase1Keys> phase1_keys{};
-    BatchCommitEntry entries[kMaxBatchSize];
-
-    std::unique_ptr<KvTransaction> txn;
-    FdbFuture commit_future;
-
-    void reset() {
-      phase = PHASE_EMPTY;
-      step = STEP_WORKING;
-      for (int i = 0; i < entry_count; ++i) {
-        entries[i].bucket_name = {};
-        entries[i].object_name = {};
-        entries[i].data = {};
-        entries[i].cond = PutCondition{};
-        entries[i].has_cond = false;
-        entries[i].tag_encoded = {};
-        entries[i].metadata_encoded = {};
-      }
-      entry_count = 0;
-      phase1_key_count = 0;
-      p3_attempt = 0;
-      start_attempt = 0;
-      txn.reset();
-      commit_future = FdbFuture();
+  struct SubmitAwaiter {
+    BatchCommitQueue* q;
+    BatchCommitEntry* e;
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> h) noexcept {
+      e->waiter = h;
+      e->waiter_exec = async::Executor::current();
+      // Last touch of this awaiter when it returns true: the entry may
+      // complete (and the waiter resume) on another thread right away.
+      return q->push(e);
     }
+    BatchPutResult await_resume() const noexcept { return e->result; }
   };
+  // co_await submit(entry) -> BatchPutResult.
+  SubmitAwaiter submit(BatchCommitEntry& e) noexcept { return SubmitAwaiter{this, &e}; }
 
-  struct WorkerState {
-    static constexpr int kMaxInflight = 4;
-    InFlightBatch slots[kMaxInflight];
-  };
+ private:
+  static constexpr int kMaxPhase1Keys = kMaxBatchSize / 2;  // 20 storage entries / 2 per Group P:O
+  using EntryList = std::array<BatchCommitEntry*, kMaxBatchSize>;
 
-  void run();
-  void start_batch(InFlightBatch& ib);
-  void fallback_to_single(InFlightBatch& ib);
-  void record_batch_stats(InFlightBatch& ib);
-  bool do_phase3_work(InFlightBatch& ib);
+  // false: not queued (stopped); e->result is set and the caller does not
+  // suspend.
+  bool push(BatchCommitEntry* e) noexcept;
+  // Under mu_: take up to batch_size entries, pushing same-key duplicates back.
+  int extract_locked(EntryList& out, int batch_size);
+  static void complete(BatchCommitEntry* e, BatchPutResult r) noexcept;
+  void complete_all(std::span<BatchCommitEntry*> es, KvrgwErrorCode ec) noexcept;
+
+  async::Task<void> form_batch();
+  async::Task<void> timeout_loop(std::chrono::steady_clock::time_point deadline);
+  async::Task<void> run_batch_task(EntryList es, int n);
+  async::Task<void> run_batch(std::span<BatchCommitEntry*> es);
+  async::Task<KvrgwErrorCode> resolve_bucket_ids(std::span<BatchCommitEntry*> es);
+  async::Task<void> fallback_to_single(std::span<BatchCommitEntry*> es);
+  void record_batch_stats(std::span<BatchCommitEntry*> es);
+  int batch_size() const;
+  std::chrono::microseconds batch_timeout() const;
+
+  struct TaskCount;  // RAII for tasks_
 
   KvRgwServiceImpl& service_;
   std::mutex mu_;
-  std::condition_variable cv_;
-  std::deque<BatchCommitEntry> pending_;
-  std::atomic<bool> stop_{false};
-  std::vector<std::thread> workers_;
+  std::deque<BatchCommitEntry*> pending_;  // under mu_
+  int forming_{0};          // under mu_: form tasks posted, not yet run
+  bool timer_armed_{false}; // under mu_
+  bool stopped_{false};     // under mu_
+  std::atomic<int> tasks_{0};
+  std::atomic<uint32_t> rr_{0};
   BatchStats stats_;
-  static constexpr int kMaxInflight = 4;
-  int max_inflight_{kMaxInflight};
 };
 
 class TierConfigState;
@@ -239,6 +256,23 @@ class KvRgwServiceImpl final {
  public:
   KvRgwServiceImpl(KvStore& store, DataStore& data_store, RefTagGenerator& ref_tags,
                    TierConfigState& tier_config, Sweeper& sweeper);
+  // Shutdown: refuse new async ops, complete queued batch entries, wait for
+  // in-flight ops to finish, then stop the backend workers.
+  ~KvRgwServiceImpl();
+
+  // ---- async runtime (see service_async.hpp)
+  const AsyncConfig& async_config() const { return async_cfg_; }
+  AsyncStats& async_stats() { return async_stats_; }
+  Admission& admission() { return admission_; }
+  BackendWorkers& backend_workers() { return workers_; }
+  // Applies txn_timeout_ms / stats to a policy for ordinary in-scope ops.
+  RetryPolicy retry_policy(int max_attempts = 0) {
+    RetryPolicy p;
+    p.max_attempts = max_attempts > 0 ? max_attempts : async_cfg_.txn_max_attempts;
+    p.timeout_ms = async_cfg_.txn_timeout_ms;
+    p.stats = &latency_stats_;
+    return p;
+  }
 
   LatencyStats& latency_stats() { return latency_stats_; }
   OpsStats& ops_stats() { return ops_stats_; }
@@ -255,7 +289,21 @@ class KvRgwServiceImpl final {
   RefTagGenerator& ref_tags() { return ref_tags_; }
   BatchCommitQueue& batch_queue() { return batch_queue_; }
 
+  // Sync wrappers over the _a ops below (sync_wait; never refused with QUEUE_FULL).
   KvrgwErrorCode create_bucket(tenant_id_t tenant_id, std::string_view bucket_name);
+  // ---- Async bucket ops (used by the perf worker's init; same semantics).
+  async::Task<KvrgwErrorCode> create_bucket_a(tenant_id_t tenant_id, std::string_view bucket_name,
+                                              Caller caller = Caller::kAsync);
+  async::Task<KvrgwErrorCode> bucket_exists_a(tenant_id_t tenant_id, std::string_view bucket_name,
+                                              bool* out_exists, Caller caller = Caller::kAsync);
+  async::Task<KvrgwErrorCode> put_bucket_versioning_a(tenant_id_t tenant_id,
+                                                      std::string_view bucket_name,
+                                                      VersioningState state,
+                                                      Caller caller = Caller::kAsync);
+  async::Task<KvrgwErrorCode> get_bucket_versioning_a(tenant_id_t tenant_id,
+                                                      std::string_view bucket_name,
+                                                      VersioningState* out_state,
+                                                      Caller caller = Caller::kAsync);
   // Resolve bucket_name → bucket_id. Returns nullopt if the bucket doesn't
   // exist. Intended for tests that need bucket_id to inspect GC KV entries.
   std::expected<std::optional<bucket_id_t>, KvrgwErrorCode>
@@ -319,6 +367,17 @@ class KvRgwServiceImpl final {
                               std::string_view continuation_token,
                               std::string_view marker,
                               ListObjectsResult* out);
+  // Async list: page loop of issue range / co_await / decode on a backend
+  // worker; *out must stay valid until the task completes.
+  async::Task<KvrgwErrorCode> list_objects_a(tenant_id_t tenant_id,
+                                             std::string_view bucket_name,
+                                             std::string_view prefix,
+                                             std::string_view delimiter,
+                                             uint32_t max_keys,
+                                             std::string_view continuation_token,
+                                             std::string_view marker,
+                                             ListObjectsResult* out,
+                                             Caller caller = Caller::kAsync);
 
   struct AWSDeleteCondition {
     std::string if_match;
@@ -354,11 +413,21 @@ class KvRgwServiceImpl final {
           created_dm(dm), dm_version_id(dm_vid) {}
   };
 
+  // Sync. With `objects` empty this is sync_wait(delete_multi_a(keys)); the
+  // versioned-object path (`objects`) stays synchronous.
   KvrgwErrorCode delete_multi(tenant_id_t tenant_id,
                               std::string_view bucket_name,
                               std::span<const std::string> keys,
                               std::span<const DeleteMultiObjectRef> objects,
                               std::vector<DeleteMultiKeyOutcome>* out);
+  // Async delete_multi for plain keys. Chunks of kMaxBatchSize keys run in
+  // sequence; each chunk issues all its reads before awaiting them, then
+  // commits. `keys` and *out must stay valid until the task completes.
+  async::Task<KvrgwErrorCode> delete_multi_a(tenant_id_t tenant_id,
+                                             std::string_view bucket_name,
+                                             std::span<const std::string> keys,
+                                             std::vector<DeleteMultiKeyOutcome>* out,
+                                             Caller caller = Caller::kAsync);
 
   struct CopyObjectRequest {
     tenant_id_t tenant_id{};
@@ -507,6 +576,17 @@ class KvRgwServiceImpl final {
   KvrgwErrorCode get_object(tenant_id_t tenant_id, std::string_view bucket_name,
                             std::string_view key, std::optional<version_id_t> version_id,
                             const ByteRange* range, uint16_t part_number, GetObjectResult* out);
+  // Async GET: admission on the caller, then the KV reads (:O: / :V:, C:E, C:D,
+  // C:M, C:S, bucket state) are awaited on a backend worker. Data-tier file
+  // reads (storage tier, multipart parts, checksum file) stay blocking calls on
+  // that worker, as PUT's blob write does. Views passed in and *out must stay
+  // valid until the task completes. get_object is its sync wrapper.
+  async::Task<KvrgwErrorCode> get_object_a(tenant_id_t tenant_id, std::string_view bucket_name,
+                                           std::string_view key,
+                                           std::optional<version_id_t> version_id,
+                                           const ByteRange* range, uint16_t part_number,
+                                           GetObjectResult* out,
+                                           Caller caller = Caller::kAsync);
 
   // part_number: same contract as get_object's, minus any body read --
   // only overrides out->hdr.size to the resolved part's size.
@@ -567,6 +647,15 @@ class KvRgwServiceImpl final {
                                       std::string_view key_marker,
                                       version_id_t version_id_marker,
                                       ListObjectVersionsResult* out);
+  // Async: issues the :O: and :V: ranges together, then awaits both.
+  async::Task<KvrgwErrorCode> list_object_versions_a(tenant_id_t tenant_id,
+                                                     std::string_view bucket_name,
+                                                     std::string_view prefix,
+                                                     uint32_t max_keys,
+                                                     std::string_view key_marker,
+                                                     version_id_t version_id_marker,
+                                                     ListObjectVersionsResult* out,
+                                                     Caller caller = Caller::kAsync);
 
   struct DeleteResult {
     bool created_dm = false;
@@ -592,25 +681,31 @@ class KvRgwServiceImpl final {
     std::string if_none_match;
   };
 
-  struct PutObjectRequest {
-    tenant_id_t tenant_id;
-    std::string_view bucket_name;
-    std::string_view object_name;
-    ObjectValue value;   // views into the caller's buffers
-    uint64_t estimated_size;
-    const PutCondition* cond;
-    std::span<const uint8_t> tags;
-    std::span<const uint8_t> metadata;
-  };
-
   struct PutObjectResult {
     KvrgwErrorCode error_code{KVRGW_ERR_OK};
     std::string etag;
     version_id_t version_id{};
   };
 
-  PutObjectResult put_object_route(PutObjectRequest& req, const uint8_t* data, size_t data_len);
+  // Async PUT. Admission, argument checks, MD5, tag / metadata encoding and
+  // tier placement run on the caller; the op then goes to the batcher
+  // (batch_size > 1) or to put_single_a on a backend worker. It completes on
+  // the caller's executor. Memory passed by view must stay valid until the
+  // task completes. Fails fast with KVRGW_ERR_QUEUE_FULL at the in-flight
+  // limit (async callers only).
+  async::Task<PutObjectResult> put_object_a(
+      tenant_id_t tenant_id,
+      std::string_view bucket_name,
+      std::string_view object_name,
+      const uint8_t* data, size_t data_len,
+      std::string_view content_type,
+      uint64_t estimated_size,
+      const AWSPutCondition* cond,
+      std::span<const TagPair> tags,
+      std::span<const MetaPair> metadata,
+      Caller caller = Caller::kAsync);
 
+  // Sync wrapper: sync_wait(put_object_a(...)). Never refused with QUEUE_FULL.
   PutObjectResult put_object(
       tenant_id_t tenant_id,
       std::string_view bucket_name,
@@ -635,8 +730,6 @@ class KvRgwServiceImpl final {
     bool is_storage_tier;
     std::span<const uint8_t> metadata{};
   };
-
-  KvrgwErrorCode put_object_in_txn(KvTransaction& tr, PutInTxnParams& params, VersioningState* out_versioning_state);
 
   friend class BatchCommitQueue;
   friend int run_perf_driver(KvRgwServiceImpl&, KvStore&, const struct PerfConfig&);
@@ -728,18 +821,37 @@ class KvRgwServiceImpl final {
   };
 
   PutContext put_prepare(KvTransaction& tr, PutInTxnParams& params, bool need_bucket);
-  KvrgwErrorCode put_finalize(KvTransaction& tr, PutContext& ctx, PutInTxnParams& params,
-                              VerifiedBucket* verified, int& verified_count,
-                              VersioningState* out_versioning_state);
+  // Resolves the reads put_prepare issued (co_await, never blocks a worker)
+  // and writes the object. A read error comes back as fdb_to_error(err);
+  // error_to_fdb() recovers the FDB code for on_error.
+  async::Task<KvrgwErrorCode> put_finalize_a(KvTransaction& tr, PutContext& ctx,
+                                             PutInTxnParams& params,
+                                             VerifiedBucket* verified, int& verified_count,
+                                             VersioningState* out_versioning_state);
+  async::Task<KvrgwErrorCode> put_in_txn_a(KvTransaction& tr, PutInTxnParams& params,
+                                           VersioningState* out_versioning_state);
 
   std::expected<std::optional<BucketState>, fdb_error_t>
   read_bucket_state(tenant_id_t tenant_id, std::string_view bucket_name);
+  async::Task<std::expected<std::optional<BucketState>, fdb_error_t>>
+  read_bucket_state_a(tenant_id_t tenant_id, std::string_view bucket_name);
 
+  // Cache lookup only; nullopt on a miss or an expired entry.
+  std::optional<BucketState> bucket_cache_lookup(tenant_id_t tenant_id,
+                                                 std::string_view bucket_name);
   std::expected<std::optional<BucketState>, fdb_error_t>
   get_bucket_id_cached(tenant_id_t tenant_id, std::string_view bucket_name);
+  // A cache hit returns without suspending; a miss awaits the B: read.
+  async::Task<std::expected<std::optional<BucketState>, fdb_error_t>>
+  get_bucket_id_cached_a(tenant_id_t tenant_id, std::string_view bucket_name);
 
   KvrgwErrorCode check_access(tenant_id_t tenant_id, std::string_view bucket_name,
                               const BucketState& cached, uint8_t deny_mask);
+  async::Task<KvrgwErrorCode> check_access_a(tenant_id_t tenant_id, std::string_view bucket_name,
+                                             BucketState cached, uint8_t deny_mask);
+  // FDB-style retry backoff without a sleeping thread: awaits on_error on a
+  // scratch transaction (FDB's own delay). No delay for a non-FDB code.
+  async::Task<void> backoff_a(KvrgwErrorCode ec);
 
   void put_bucket_cache(tenant_id_t tenant_id, std::string_view bucket_name, bucket_id_t bucket_id,
                         uint8_t access_flags = 0, VersioningState versioning_state = VERSIONING_DISABLED);
@@ -765,6 +877,9 @@ class KvRgwServiceImpl final {
   KvrgwErrorCode resolve_bucket_error(tenant_id_t tenant_id,
                                       std::string_view bucket_name,
                                       KvrgwErrorCode tentative_err_code);
+  async::Task<KvrgwErrorCode> resolve_bucket_error_a(tenant_id_t tenant_id,
+                                                     std::string_view bucket_name,
+                                                     KvrgwErrorCode tentative_err_code);
 
   struct LoadResult {
     OwnedObjectValue value;
@@ -774,11 +889,18 @@ class KvRgwServiceImpl final {
   // The :O: value is read through an FdbGetHolder (zero-copy) and parsed in
   // place; only the <= 1 KB raw value is copied once into the result, so its
   // views outlive the future.
+  // The read helpers below have awaitable (_a) forms; each sync form is
+  // sync_wait() over it and runs inline on the calling thread (FDB awaits block
+  // there, as before). The sync forms must not be called on an executor thread.
   std::expected<std::optional<OwnedObjectValue>, fdb_error_t>
   load_object(bucket_id_t bucket_id, std::string_view object_name);
+  async::Task<std::expected<std::optional<OwnedObjectValue>, fdb_error_t>>
+  load_object_a(bucket_id_t bucket_id, std::string_view object_name);
 
   std::expected<std::optional<LoadResult>, fdb_error_t>
   load_object_with_data(bucket_id_t bucket_id, std::string_view object_name);
+  async::Task<std::expected<std::optional<LoadResult>, fdb_error_t>>
+  load_object_with_data_a(bucket_id_t bucket_id, std::string_view object_name);
 
   // want_manifest: bind the manifest (local copy, else C:E / C:M per the
   // location nibbles) into value->manifest_blob.
@@ -792,12 +914,30 @@ class KvRgwServiceImpl final {
       std::string* kv_data,
       std::string* error_detail,
       bool want_manifest = false);
+  async::Task<KvrgwErrorCode> load_object_for_read_a(
+      tenant_id_t tenant_id,
+      std::string_view bucket_name,
+      std::string_view key,
+      std::optional<version_id_t> version_id,
+      bool load_kv_data,
+      OwnedObjectValue* value,
+      std::string* kv_data,
+      std::string* error_detail,
+      bool want_manifest = false);
+  // The common tail of load_object_for_read_a: delete-marker check, then bind
+  // C:E and (on request) the manifest.
+  async::Task<KvrgwErrorCode> accept_read_a(
+      tenant_id_t tenant_id, std::string_view bucket_name, bucket_id_t bucket_id,
+      OwnedObjectValue obj, std::string data, OwnedObjectValue* value,
+      std::string* kv_data, std::string* error_detail, bool want_manifest);
 
   // Reads C:E for an object with kFlagExternalMetadata and binds its
   // metadata_frame (and, per the flags / manifest_loc, the manifest tail)
   // into `v`; the bytes live in v.child_e_raw. No-op without the flag.
   KvrgwErrorCode bind_child_e(bucket_id_t bucket_id, OwnedObjectValue& v,
                               KvTransaction* tr = nullptr);
+  async::Task<KvrgwErrorCode> bind_child_e_a(bucket_id_t bucket_id, OwnedObjectValue& v,
+                                             KvTransaction* tr = nullptr);
 
   // Multipart child loaders. Read rule: a local copy in :O: is always used;
   // C:E / C:M / C:S / the checksum file are read only when none is stored.
@@ -806,6 +946,8 @@ class KvRgwServiceImpl final {
   // v.manifest_blob (backed by v.child_e_raw).
   KvrgwErrorCode load_manifest(bucket_id_t bucket_id, OwnedObjectValue& v,
                                KvTransaction* tr = nullptr);
+  async::Task<KvrgwErrorCode> load_manifest_a(bucket_id_t bucket_id, OwnedObjectValue& v,
+                                              KvTransaction* tr = nullptr);
   // Per-part digests of entries [first_rank, first_rank + count) of the
   // object's included parts, concatenated (count * digest_len bytes).
   KvrgwErrorCode load_checksum_blob(bucket_id_t bucket_id, const ObjectValue& v,
@@ -816,6 +958,9 @@ class KvRgwServiceImpl final {
   KvrgwErrorCode load_checksum_slice(bucket_id_t bucket_id, const ObjectValue& v,
                                      size_t first_rank, size_t count, uint8_t* out,
                                      KvTransaction* tr = nullptr);
+  async::Task<KvrgwErrorCode> load_checksum_slice_a(bucket_id_t bucket_id, const ObjectValue& v,
+                                                    size_t first_rank, size_t count,
+                                                    uint8_t* out, KvTransaction* tr = nullptr);
 
   bool move_object_to_g(KvTransaction& tr, std::string_view object_key, const ObjectValue& value);
 
@@ -1005,13 +1150,19 @@ class KvRgwServiceImpl final {
                            VersioningState versioning_state,
                            GcDescriptor& out) const;
 
-  bool delete_multi_try_commit(
+  async::Task<bool> delete_multi_try_commit_a(
       tenant_id_t tenant_id,
       const std::string& bucket_name,
       bucket_id_t bucket_id,
       std::span<const std::string> keys,
       std::span<DeleteContext> ctxs,
       std::vector<DeleteMultiKeyOutcome>* out);
+  async::Task<void> delete_multi_one_key_a(
+      tenant_id_t tenant_id,
+      const std::string& bucket_name,
+      bucket_id_t bucket_id,
+      std::string_view key,
+      std::vector<DeleteMultiKeyOutcome>& outcomes);
   void delete_multi_one_key(
       tenant_id_t tenant_id,
       const std::string& bucket_name,
@@ -1019,7 +1170,8 @@ class KvRgwServiceImpl final {
       std::string_view key,
       std::vector<DeleteMultiKeyOutcome>& outcomes);
 
-  KvrgwErrorCode put_object_phase3(
+  // Phase 3 of a non-batched storage-tier PUT (the blob and P:O exist).
+  async::Task<KvrgwErrorCode> put_phase3_a(
       tenant_id_t tenant_id,
       std::string_view bucket_name,
       bucket_id_t bucket_id,
@@ -1030,7 +1182,8 @@ class KvRgwServiceImpl final {
       std::span<const uint8_t> tags = {},
       std::span<const uint8_t> metadata = {});
 
-  KvrgwErrorCode put_object_single_txn(
+  // One-transaction PUT (inline / C:E / C:D tiers); also the batch fallback.
+  async::Task<KvrgwErrorCode> put_single_a(
       tenant_id_t tenant_id,
       std::string_view bucket_name,
       std::string_view object_name,
@@ -1041,8 +1194,8 @@ class KvRgwServiceImpl final {
       std::span<const uint8_t> tags = {},
       std::span<const uint8_t> metadata = {});
 
-  // Storage tier only: the caller has already chosen the tier.
-  KvrgwErrorCode put_object_storage_tier(
+  // Storage tier only (non-batched): P:O, blob, then phase 3.
+  async::Task<KvrgwErrorCode> put_storage_a(
       tenant_id_t tenant_id,
       std::string_view bucket_name,
       std::string_view object_name,
@@ -1067,10 +1220,33 @@ class KvRgwServiceImpl final {
       FdbGetHolder& holder,
       bucket_id_t expected_bucket_id,
       uint8_t deny_mask = 0);
+  async::Task<std::expected<BucketState, KvrgwErrorCode>>
+  resolve_bucket_verify_a(
+      tenant_id_t tenant_id,
+      std::string_view bucket_name,
+      FdbGetHolder& holder,
+      bucket_id_t expected_bucket_id,
+      uint8_t deny_mask = 0);
+  // The non-blocking part of resolve_bucket_verify: `err` is the holder's
+  // wait / co_await result.
+  std::expected<BucketState, KvrgwErrorCode>
+  finish_bucket_verify(
+      tenant_id_t tenant_id,
+      std::string_view bucket_name,
+      FdbGetHolder& holder,
+      fdb_error_t err,
+      bucket_id_t expected_bucket_id,
+      uint8_t deny_mask);
 
   KvStore& store_;
   DataStore& data_store_;
   RefTagGenerator& ref_tags_;
+  // Async runtime state. Declared before everything that may hold ops, so it
+  // is destroyed last; the destructor body drains in-flight ops first.
+  AsyncConfig async_cfg_;
+  AsyncStats async_stats_;
+  Admission admission_{async_stats_};
+  BackendWorkers workers_;
   TierConfigState& tier_config_state_;
   Sweeper& sweeper_;
   LatencyStats latency_stats_;

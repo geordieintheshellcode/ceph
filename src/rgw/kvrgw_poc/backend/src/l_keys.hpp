@@ -17,6 +17,7 @@
 #include "error_codes.hpp"
 #include "kv_store.hpp"
 #include "keys.hpp"
+#include "service_async.hpp"
 
 #include <cstdint>
 #include <span>
@@ -40,6 +41,9 @@ class LKeyNumericCounter {
   static KvrgwErrorCode allocate(KvStore& store,
 				 std::string_view counter_name,
 				 uint64_t& out_id);
+  // Awaitable variant: one retry_txn (FDB backoff through on_error).
+  static async::Task<std::expected<uint64_t, KvrgwErrorCode>>
+  allocate_a(KvStore& store, std::string_view counter_name, RetryPolicy pol);
 };
 
 } // namespace kvrgw

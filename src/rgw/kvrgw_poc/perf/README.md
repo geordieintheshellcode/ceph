@@ -30,6 +30,57 @@ or, non-interactively from the host, `make shell CMD='make build'` (and `CMD='ma
 gRPC/protobuf are not needed and nothing here is built. The first `go build`/`go test` downloads
 Go modules, so the container needs network access.
 
+## Client models (driver_mode)
+
+Concurrency is counted in *streams*: sequential clients with one op in flight.
+
+- `driver_mode: sync` (default): one blocking thread per stream calling the sync
+  service API (a thread-per-request client, as the C API / gateway is).
+- `driver_mode: async`: `streams_per_worker` coroutines on `driver_threads`
+  executors calling the `_a` service ops, so concurrency is not bounded by thread
+  count. Example: `--driver-mode async --streams 1024 --driver-threads 2`.
+- Open loop: `--driver-mode async --rate 20000` issues 20,000 ops/s per worker on a
+  fixed schedule and measures latency from each op's scheduled time; `missed` counts
+  ops that could not be issued (the rate was not held). `send_lag` (send time minus
+  scheduled time per op) shows how much of that latency is the driver sending late:
+  the driver thread that sends also prepares ops and handles their completions, so a
+  busy driver sends late. The report flags send lag only when its p99 is over 1 ms and
+over 10% of the op's p99, and suggests more `driver_threads` when drivers are busy
+(otherwise the lag is from send bursts); a smaller lag is noted as negligible.
+
+Async runtime knobs live in the `kvrgw:` section (`backend_workers`,
+`max_inflight_ops`, `txn_max_attempts`, `batch_txn_max_attempts`,
+`txn_timeout_ms`). A non-zero `queue_full` means `streams_per_worker` exceeded
+`max_inflight_ops`. To compare against the pre-async backend, run the old worker
+binary with the same configuration.
+
+Ramp: `--ramp` on run-put-object / -overwrite / -overwrite-versioned finds the maximum
+sustainable rate. It offers `ramp_start_rate`, then `+ ramp_step_rate` per step (cluster
+totals), each step a warm-up then a measured window, and stops at the first step that
+misses a criterion (p99 below `ramp_max_p99_ms`, achieved, missed, errors, backlog); a
+step where the load generator itself is the limit is reported as invalid. With
+`--ramp-mode throughput` only throughput counts: it ramps until a step completes less
+than 98% of its target, whatever the latency. `duration` does not apply to a ramp.
+Every async run first logs Little's-law bound: max rate = in-flight cap
+(`max_inflight_ops` x workers) / mean latency. Examples:
+
+    kvrgw-perf --ramp --ramp-start-rate 5000 --ramp-step-rate 1000 run-put-object-overwrite
+    kvrgw-perf --ramp --ramp-mode throughput --ramp-start-rate 5000 --ramp-step-rate 2000 run-put-object-overwrite
+
+`--arrival poisson` uses exponential inter-arrival times (any open-loop run). Results:
+the live per-step lines, `ramp_steps.csv`, `summary.json` and the report's Ramp section.
+Prefer run-put-object-overwrite for a capacity number: run-put-object grows the data set
+for the whole ramp. Details: `RAMP.md`.
+
+Thread utilisation: every progress report carries CPU and wall time for each backend
+worker (`kvrgw-be-N`), the FDB client network thread (`fdb-network`) and each async
+driver (`perf-drv-N`), plus libfdb_c's own network-thread busyness. The report's
+"Thread utilisation" section shows busy % per group (per thread with `--detailed`)
+over the analysed window, with hints: a saturated `fdb-network` means add worker
+processes; saturated backend workers or drivers mean raise `backend_workers` /
+`driver_threads`; mostly idle ones can be lowered. The run summary prints the same
+per-group figures for the whole run.
+
 ## Running on another machine
 
 To run the harness somewhere that has Docker and an FDB cluster but no build environment, package it
@@ -104,7 +155,8 @@ Resolution is built-in default <- `base` <- command section <- CLI flag; keys ar
 and every key is also a `--kebab-case` flag (`--batch-size`, `--max-inline`, ...).
 The controller synthesizes `<run-dir>/kvrgw.yaml` from the `kvrgw` section and points the
 workers at it (`KVRGW_CONFIG_FILE`), so `backend/kvrgw.yaml` is not used. The runtime's yaml
-loader ignores `batch_*`, so the controller also exports them as `KVRGW_BATCH_*`.
+loader ignores `batch_*` and the async keys, so the controller also exports them as
+`KVRGW_*` environment variables.
 See SPEC.md section 5.1 for the key table.
 Each invocation is independent: `load` once, then any number of `run-*`, using the same
 layout config. `run-*` commands take exactly one of `--ops N` / `--duration D`.
@@ -112,7 +164,7 @@ layout config. `run-*` commands take exactly one of `--ops N` / `--duration D`.
 Local mode (the only mode in v1) spawns `worker_count` workers on `127.0.0.1:<base-port+i>` (base port 19090 by default, `--base-port` to change);
 `--cpus 0-15` splits a CPU pool across them with `taskset`.
 
-Results directory: `config.resolved.json kvrgw.yaml events.csv metrics.csv errors.csv hist.csv server_stats.csv
+Results directory: `config.resolved.json kvrgw.yaml events.csv metrics.csv errors.csv hist.csv server_stats.csv ramp_steps.csv (--ramp)
 cpu.csv fdb_cluster.csv fdb_process.csv fdb_cpu.csv fdb_status_start.json summary.json controller.log
 worker-<i>.log` (spec section 8.1). FDB files are present only if `fdbcli` works.
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"kvrgw-perf/internal/collect"
+	"kvrgw-perf/internal/ramp"
 	"kvrgw-perf/internal/results"
 	"kvrgw-perf/internal/stats"
 )
@@ -58,6 +59,8 @@ type metricRow struct {
 	op        string
 	count     uint64
 	errors    uint64
+	queueFull uint64 // QUEUE_FULL backoffs (absent in older results)
+	missed    uint64 // open-loop ops not issued (absent in older results)
 	opsPerSec float64
 	meanUs    float64
 	hasLat    bool
@@ -158,6 +161,9 @@ func load(dir string) (*data, error) {
 			}
 			m := metricRow{ts: pi(r[0]), window: pi(r[1]), op: r[2], count: pu(r[3]), errors: pu(r[4]),
 				opsPerSec: pf(r[5])}
+			if len(r) >= 16 {
+				m.queueFull, m.missed = pu(r[14]), pu(r[15])
+			}
 			if r[6] != "" {
 				m.hasLat = true
 				m.meanUs, m.p50, m.p99 = pf(r[6]), pf(r[7]), pf(r[9])
@@ -341,7 +347,23 @@ func (d *data) print(w io.Writer, o Options) {
 	}
 	if d.sum != nil {
 		p := d.sum.Parameters
-		fmt.Fprintf(w, " Operation : %s      Workers: %d x %d threads   Buckets: %d\n", d.sum.Command, p.WorkerCount, p.ThreadsPerWorker, p.NumBuckets)
+		fmt.Fprintf(w, " Operation : %s      Buckets: %d\n", d.sum.Command, p.NumBuckets)
+		mode := p.DriverMode
+		if mode == "" {
+			mode = "sync" // results from before driver_mode existed
+		}
+		if p.RateOpsPerSec > 0 {
+			fmt.Fprintf(w, " Clients   : %d workers x %d generators   driver_mode: %s", p.WorkerCount, p.Generators(), mode)
+		} else {
+			fmt.Fprintf(w, " Clients   : %d workers x %d streams   driver_mode: %s", p.WorkerCount, p.Streams(), mode)
+		}
+		if mode == "async" {
+			fmt.Fprintf(w, "   driver_threads: %d", p.DriverThreads)
+		}
+		if p.RateOpsPerSec > 0 {
+			fmt.Fprintf(w, "   rate_ops_per_sec: %g per worker (open loop)", p.RateOpsPerSec)
+		}
+		fmt.Fprintln(w)
 	}
 	fmt.Fprintf(w, " Benchmark : %s -> %s (%.0fs)   Warmup skipped: first %s\n", clock(d.startMs), clock(d.endMs),
 		float64(d.endMs-d.startMs)/1000, o.Warmup)
@@ -375,9 +397,14 @@ func (d *data) print(w io.Writer, o Options) {
 		}
 	}
 
+	if d.sum != nil && d.sum.Ramp != nil {
+		banner(w, "Ramp")
+		ramp.PrintTable(w, d.sum.Ramp)
+	}
 	d.printClient(w, o, from, to)
 	d.printCPU(w, o, from, to)
 	d.printServer(w, o, from, to)
+	d.printThreads(w, o, from, to)
 	if d.hasFDB {
 		d.printFDB(w, o, from, to)
 	}
@@ -410,9 +437,10 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 	pw := detailedWriter(w, o)
 	subHeading(pw, "Per-window statistics", fmt.Sprintf("%d windows of %s, merged across workers", nwin, winLen), windowNote)
 	type total struct {
-		count, errs uint64
-		meanUs      float64
-		hist        stats.Hist
+		count, errs       uint64
+		queueFull, missed uint64
+		meanUs            float64
+		hist              stats.Hist
 	}
 	totals := map[string]*total{}
 	for _, op := range ops {
@@ -439,6 +467,8 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 			wins[m.window] = true
 			t.count += m.count
 			t.errs += m.errors
+			t.queueFull += m.queueFull
+			t.missed += m.missed
 			if m.hasLat {
 				sumUs += m.meanUs * float64(m.count)
 				latCount += m.count
@@ -487,18 +517,92 @@ func (d *data) printClient(w io.Writer, o Options, from, to int64) {
 		}
 	}
 	if len(latOps) > 0 {
-		opsW, errW := wide(12, "ops"), wide(9, "errors")
+		// The queue_full column (submits refused at the backend's in-flight limit) is shown for
+		// async-mode runs, and for any run where it is non-zero.
+		showQF := d.sum != nil && d.sum.Parameters.DriverMode == "async"
+		opsW, errW, qfW := wide(12, "ops"), wide(9, "errors"), 0
 		for _, op := range latOps {
 			t := totals[op]
 			opsW = wide(opsW, grouped(int64(t.count)))
 			errW = wide(errW, grouped(int64(t.errs)))
+			showQF = showQF || t.queueFull > 0
 		}
-		fmt.Fprintf(w, " %-14s%*s%*s%11s%9s%9s%9s%9s%9s\n", "op", opsW, "ops", errW, "errors", "avg ops/s", "mean_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms")
+		qfHdr := ""
+		if showQF {
+			qfW, qfHdr = wide(12, "queue_full"), "queue_full"
+			for _, op := range latOps {
+				qfW = wide(qfW, grouped(int64(totals[op].queueFull)))
+			}
+		}
+		fmt.Fprintf(w, " %-14s%*s%*s%*s%11s%9s%9s%9s%9s%9s\n", "op", opsW, "ops", errW, "errors", qfW, qfHdr,
+			"avg ops/s", "mean_ms", "p50_ms", "p90_ms", "p99_ms", "p999_ms")
 		for _, op := range latOps {
 			t := totals[op]
-			fmt.Fprintf(w, " %-14s%*s%*s%11s%9s%9s%9s%9s%9s\n", op, opsW, grouped(int64(t.count)), errW, grouped(int64(t.errs)),
+			qf := ""
+			if showQF {
+				qf = grouped(int64(t.queueFull))
+			}
+			fmt.Fprintf(w, " %-14s%*s%*s%*s%11s%9s%9s%9s%9s%9s\n", op, opsW, grouped(int64(t.count)), errW, grouped(int64(t.errs)),
+				qfW, qf,
 				num(float64(t.count)/runSecs), stats.MsNum(t.meanUs), stats.MsNum(float64(t.hist.Quantile(0.5))),
 				stats.MsNum(float64(t.hist.Quantile(0.9))), stats.MsNum(float64(t.hist.Quantile(0.99))), stats.MsNum(float64(t.hist.Quantile(0.999))))
+		}
+	}
+	if d.sum != nil && d.sum.Parameters.RateOpsPerSec > 0 {
+		p := d.sum.Parameters
+		target := p.RateOpsPerSec * float64(p.WorkerCount)
+		var achieved float64
+		var missed uint64
+		for _, op := range latOps {
+			achieved += float64(totals[op].count) / runSecs
+			missed += totals[op].missed
+		}
+		fmt.Fprintf(w, "\n open loop    : target %s ops/s, achieved %s ops/s (%.1f%%), missed %s; latency from scheduled send time\n",
+			num(target), num(achieved), 100*achieved/target, grouped(int64(missed)))
+		// Send lag: how late ops left the driver relative to their slots (merged histogram).
+		var lag stats.Hist
+		wins := map[int64]bool{}
+		for _, m := range d.metrics {
+			if m.op == "send_lag" && m.ts > from && m.ts <= to {
+				wins[m.window] = true
+			}
+		}
+		for win := range wins {
+			lag.Merge(d.hist["send_lag"][win])
+		}
+		if lag.Total() > 0 {
+			fmt.Fprintf(w, " send lag     : p50 %s  p90 %s  p99 %s  p999 %s  max %s ms (send time - scheduled time)\n",
+				stats.MsNum(float64(lag.Quantile(0.5))), stats.MsNum(float64(lag.Quantile(0.9))),
+				stats.MsNum(float64(lag.Quantile(0.99))), stats.MsNum(float64(lag.Quantile(0.999))),
+				stats.MsNum(float64(lag.Max())))
+			// Compare with the op's own p99 (the busiest open-loop op) and with driver busy %.
+			var opP99 uint64
+			var most uint64
+			for _, op := range latOps {
+				if t := totals[op]; t.count > most {
+					most, opP99 = t.count, t.hist.Quantile(0.99)
+				}
+			}
+			var driverMax float64
+			for _, g := range stats.GroupUtils(d.threadUtils(from, to)) {
+				if g.Group == "driver" {
+					driverMax = g.Max
+				}
+			}
+			if line := sendLagHint(lag.Quantile(0.99), opP99, driverMax); line != "" {
+				fmt.Fprintln(w, line)
+			}
+		}
+	}
+	// Client-side health.
+	for _, op := range latOps {
+		if t := totals[op]; t.queueFull > 0 {
+			fmt.Fprintf(w, " [WARN] %s: %s submits hit the backend in-flight limit (queue_full): streams_per_worker exceeds max_inflight_ops\n",
+				op, grouped(int64(t.queueFull)))
+		}
+		if t := totals[op]; t.missed > 0 {
+			fmt.Fprintf(w, " [WARN] %s: %s scheduled ops were not issued (missed): the target rate was not held\n",
+				op, grouped(int64(t.missed)))
 		}
 	}
 	if len(ctrOps) > 0 {
@@ -941,7 +1045,8 @@ func (d *data) printServer(w io.Writer, o Options, from, to int64) {
 	secs := float64(to-from) / 1000
 	var opNames []string
 	for n := range d.server {
-		if op, ok := strings.CutSuffix(n, ".count"); ok && !strings.HasPrefix(n, "batch.") && !strings.HasPrefix(n, "txn.") {
+		if op, ok := strings.CutSuffix(n, ".count"); ok && !strings.HasPrefix(n, "batch.") && !strings.HasPrefix(n, "txn.") &&
+			!strings.HasPrefix(n, "async.") {
 			opNames = append(opNames, op)
 		}
 	}
@@ -1006,6 +1111,19 @@ func (d *data) printServer(w io.Writer, o Options, from, to int64) {
 	}
 	fmt.Fprintf(w, "\n %-14s%12s%14s\n", "txn", "retries", "hard_failures")
 	fmt.Fprintf(w, " %-14s%12s%14s\n", "", grouped(int64(rt)), grouped(int64(hf)))
+	if _, ok := d.server["async.queue_full_rejects"]; ok {
+		qf, _ := d.serverDelta("async.queue_full_rejects", from, to)
+		// The peak is a gauge (summed over workers per sample): report its highest value.
+		var peak float64
+		for _, s := range inSamples(d.server["async.inflight_ops_peak"], d.startMs, to) {
+			peak = math.Max(peak, s)
+		}
+		fmt.Fprintf(w, "\n %-14s%20s%20s\n", "async", "queue_full_rejects", "inflight_ops_peak")
+		fmt.Fprintf(w, " %-14s%20s%20s\n", "", grouped(int64(qf)), grouped(int64(peak)))
+		if qf > 0 {
+			fmt.Fprintln(w, " [WARN] the backend refused ops at its in-flight limit (max_inflight_ops)")
+		}
+	}
 	fmt.Fprintf(w, " server errors: %s\n", orNone(errs))
 }
 
@@ -1461,4 +1579,158 @@ func (d *data) printFDBDisk(w io.Writer) {
 		fmt.Fprintf(w, "   end %s   change %s%s", bytesStr(end), sign, bytesStr(math.Abs(end-start)))
 	}
 	fmt.Fprintln(w)
+}
+
+// Thread utilisation -----------------------------------------------------------------------
+
+// Open-loop send-lag hints. Send lag matters only when it is a meaningful share of the
+// op's own latency; it is blamed on the drivers only when they are busy, otherwise it
+// comes from bursts (late timer wake-ups, preparing due ops back to back).
+const (
+	sendLagWarnUs     = stats.SendLagMinUs // below this p99 the lag is never reported
+	sendLagShare      = stats.SendLagShare // lag p99 / op p99 above this is significant
+	sendLagDriverBusy = 0.50               // drivers at or above this are a plausible cause
+)
+
+// sendLagHint returns the report line for open-loop send lag, or "" when there is nothing
+// to say. lagP99Us / opP99Us are microseconds; driverMax is the busiest driver (0..1).
+func sendLagHint(lagP99Us, opP99Us uint64, driverMax float64) string {
+	if lagP99Us < sendLagWarnUs {
+		return ""
+	}
+	lag := stats.MsNum(float64(lagP99Us))
+	share := 1.0
+	if opP99Us > 0 {
+		share = float64(lagP99Us) / float64(opP99Us)
+	}
+	if share < sendLagShare {
+		return fmt.Sprintf(" [INFO] send lag p99 %s ms is %.1f%% of op p99 %s ms: client-side sending delay is negligible",
+			lag, 100*share, stats.MsNum(float64(opP99Us)))
+	}
+	if driverMax >= sendLagDriverBusy {
+		return fmt.Sprintf(" [WARN] ops left the driver late (send lag p99 %s ms, %.0f%% of op p99) and the busiest driver is %.0f%% busy: "+
+			"part of the measured latency is client-side; raise driver_threads", lag, 100*share, 100*driverMax)
+	}
+	return fmt.Sprintf(" [WARN] ops left the driver late (send lag p99 %s ms, %.0f%% of op p99) although drivers are at most %.0f%% busy: "+
+		"the lag comes from bursts (late timer wake-ups, preparing due ops back to back); more driver_threads would spread them",
+		lag, 100*share, 100*driverMax)
+}
+
+// Utilisation thresholds for the tuning hints.
+const (
+	threadHot  = 0.85
+	threadCool = 0.25
+)
+
+// threadUtils returns each runtime thread's busy fraction (delta CPU / delta wall) over the
+// analysed window.
+func (d *data) threadUtils(from, to int64) []stats.ThreadUtil {
+	var out []stats.ThreadUtil
+	for n := range d.server {
+		g, wk, name, f, ok := stats.ParseThreadKey(n)
+		if !ok || f != "cpu_ns" {
+			continue
+		}
+		cpu, ok1 := d.serverDelta(n, from, to)
+		wall, ok2 := d.serverDelta("thread."+g+"."+wk+"."+name+".wall_ns", from, to)
+		if !ok1 || !ok2 || wall <= 0 || cpu < 0 {
+			continue
+		}
+		out = append(out, stats.ThreadUtil{Group: g, Worker: wk, Name: name, Util: cpu / wall})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Group != out[j].Group {
+			return out[i].Group < out[j].Group
+		}
+		if out[i].Worker != out[j].Worker {
+			return natLess(out[i].Worker, out[j].Worker)
+		}
+		return natLess(out[i].Name, out[j].Name)
+	})
+	return out
+}
+
+func (d *data) printThreads(w io.Writer, o Options, from, to int64) {
+	ts := d.threadUtils(from, to)
+	if len(ts) == 0 {
+		return
+	}
+	banner(w, "Thread utilisation")
+	subHeading(w, "Run totals", fmt.Sprintf("%s analysed; busy = CPU time / wall time per thread", time.Duration(to-from)*time.Millisecond),
+		"backend: kvrgw backend workers (backend_workers); fdb-network: the FDB client network thread "+
+			"(one per worker process); driver: perf async driver executors (driver_threads)")
+	gs := stats.GroupUtils(ts)
+	fmt.Fprintf(w, " %-14s%9s%11s%11s   %s\n", "group", "threads", "avg_busy", "max_busy", "busiest")
+	for _, g := range gs {
+		fmt.Fprintf(w, " %-14s%9d%10.1f%%%10.1f%%   %s\n", g.Group, g.Threads, 100*g.Avg, 100*g.Max, g.Busiest)
+	}
+	// libfdb_c's own view of its network thread (a recent-window gauge, sampled per window).
+	var busy []float64
+	for n, s := range d.server {
+		if strings.HasPrefix(n, "fdbnet.") && strings.HasSuffix(n, ".busyness_ppm") {
+			for _, v := range inSamples(s, from, to) {
+				busy = append(busy, v/1e6)
+			}
+		}
+	}
+	var busyMax float64
+	if len(busy) > 0 {
+		sm := stats.Summarize(busy, o.Deviation)
+		busyMax = sm.Max
+		fmt.Fprintf(w, "\n fdb client network busyness (libfdb_c): avg %.1f%%, max %.1f%% over %d samples\n",
+			100*sm.Avg, 100*sm.Max, len(busy))
+	}
+	if o.Detailed {
+		fmt.Fprintf(w, "\n %-14s%-8s%-18s%11s\n", "group", "worker", "thread", "busy")
+		for _, t := range ts {
+			fmt.Fprintf(w, " %-14s%-8s%-18s%10.1f%%\n", t.Group, t.Worker, t.Name, 100*t.Util)
+		}
+	}
+
+	// Tuning hints.
+	fmt.Fprintln(w)
+	get := func(group string) (stats.GroupUtil, bool) {
+		for _, g := range gs {
+			if g.Group == group {
+				return g, true
+			}
+		}
+		return stats.GroupUtil{}, false
+	}
+	hot := false
+	if g, ok := get("fdb-network"); ok && (g.Max >= threadHot || busyMax >= threadHot) {
+		hot = true
+		fmt.Fprintf(w, " [WARN] FDB client network thread near saturation (busiest %.0f%%, libfdb_c max %.0f%%): it is the per-process ceiling; add worker processes (worker_count), not threads\n",
+			100*g.Max, 100*busyMax)
+	}
+	if g, ok := get("backend"); ok {
+		switch {
+		case g.Avg >= threadHot:
+			hot = true
+			fmt.Fprintf(w, " [WARN] backend workers saturated (avg %.0f%%): raise backend_workers if the host has idle cores\n", 100*g.Avg)
+		case g.Max >= threadHot:
+			hot = true
+			fmt.Fprintf(w, " [WARN] backend worker %s at %.0f%% while the average is %.0f%%: ops are pinned to one worker each, so load is uneven\n",
+				g.Busiest, 100*g.Max, 100*g.Avg)
+		case g.Avg < threadCool && g.PerWorker > 1:
+			fmt.Fprintf(w, " [INFO] backend workers mostly idle (avg %.0f%%): backend_workers could be lowered\n", 100*g.Avg)
+		}
+	}
+	if g, ok := get("driver"); ok {
+		switch {
+		case g.Avg >= threadHot:
+			hot = true
+			fmt.Fprintf(w, " [WARN] async driver threads saturated (avg %.0f%%): raise driver_threads; client latency includes driver queueing\n", 100*g.Avg)
+		case g.Max >= threadHot:
+			hot = true
+			fmt.Fprintf(w, " [WARN] driver %s at %.0f%% while the average is %.0f%%: streams are pinned to drivers, so load is uneven\n",
+				g.Busiest, 100*g.Max, 100*g.Avg)
+		case g.Avg < threadCool && g.PerWorker > 1:
+			fmt.Fprintf(w, " [INFO] async driver threads mostly idle (avg %.0f%%): driver_threads could be lowered\n", 100*g.Avg)
+		}
+	}
+	if !hot {
+		fmt.Fprintln(w, " [OK] no backend, FDB network or driver thread is saturated: the limit is elsewhere "+
+			"(FDB servers, host CPU, network) or in the offered load (streams / rate)")
+	}
 }

@@ -79,6 +79,7 @@ type invocation struct {
 	benchEndMs                     int64
 	fdbStart, fdbEnd               *collect.ClusterSample
 	fdbConfig                      []collect.RoleRow
+	ramp                           *rampDriver // --ramp runs only
 }
 
 func (v *invocation) fail(format string, a ...any) {
@@ -261,7 +262,7 @@ func (v *invocation) execute(sigCtx, mctx, cctx context.Context, wg *sync.WaitGr
 	}
 
 	// ---- Init ----
-	fmt.Fprintf(v.out, "initialising %d worker(s) x %d thread(s)...\n", cfg.WorkerCount, cfg.ThreadsPerWorker)
+	fmt.Fprintf(v.out, "initialising %s...\n", cfg.ConcurrencyLabel())
 	ictx, cancelI := context.WithTimeout(mctx, 5*time.Minute)
 	errs := v.forAll(func(i int, w *workerConn) error {
 		st, err := w.client.Init(ictx, &pb.InitRequest{

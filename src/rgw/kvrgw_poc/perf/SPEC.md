@@ -51,9 +51,17 @@ Hard constraints:
 
 - **worker**: one `kvrgw-perf-worker` process (models one RGW instance).
   `worker_index` in `[0, worker_count)`.
-- **thread**: a benchmark thread within a worker. `threads_per_worker` per worker.
-  `global_thread_id = worker_index * threads_per_worker + thread_id`,
-  `total_threads = worker_count * threads_per_worker`.
+- **stream**: the unit of concurrency — a sequential client with at most one op in
+  flight. `streams_per_worker` per worker (default `threads_per_worker`). In
+  `driver_mode: sync` a stream is a blocking benchmark thread calling the sync API; in
+  `driver_mode: async` it is a coroutine on one of `driver_threads` executors calling
+  the `_a` (async) API. `gsid = worker_index * streams_per_worker + sid`,
+  `total_streams = worker_count * streams_per_worker`. Key spaces, `--ops` quotas and
+  `thread_counts` are per stream. (In open loop, `rate_ops_per_sec > 0`, each driver
+  thread is one generator and plays the role of a stream: `gsid = worker_index *
+  driver_threads + driver`.)
+- **thread**: in sync mode, the thread running one stream. Older text that says
+  "thread" for the unit of concurrency means "stream".
 - **invocation**: one run of the controller binary executing one command
   (`load` or one `run-*`). Each invocation is independent; the *caller* is
   responsible for sequencing (e.g. `load` once, then several `run-*`). The harness
@@ -343,10 +351,19 @@ and `perf_driver.cpp` (`KVRGW_*` env handling, key prefix/suffix lengths,
 | `padding_bytes` | 16 (match existing key-length default if one exists) | length of random key prefix |
 | `object_size_bytes` | 8192 | payload size |
 | `worker_count` | 1 | number of worker processes |
-| `threads_per_worker` | 1 | benchmark threads per worker |
+| `threads_per_worker` | 1 | sync mode: one benchmark thread per stream; also the default for `streams_per_worker` |
+| `driver_mode` | `sync` | `sync`: one blocking thread per stream calling the sync API. `async`: streams are coroutines on `driver_threads` executors calling the `_a` ops. Compares client models on one build |
+| `streams_per_worker` | = `threads_per_worker` (0 in the file) | closed-loop concurrency per worker |
+| `driver_threads` | 2 | async mode: executor threads driving the streams |
+| `rate_ops_per_sec` | 0 (closed loop) | per-worker target rate; > 0 = open loop (async mode; run-put-object, run-put-object-overwrite(-versioned), run-delete-multi). Latency is measured from each op's scheduled time; ops due beyond `max_inflight_ops / driver_threads` outstanding are counted as `missed`; `send_lag` records how late each op was sent |
+| `arrival` | `constant` | open-loop inter-arrival times: `constant` (op *k* at `anchor + (k·D + driver)/rate`) or `poisson` (exponential gaps, mean `D/rate`, per-generator seed) |
+| `ramp` (`--ramp`) | false | run-put-* only: an open-loop ramp to the maximum sustainable rate, configured by the `ramp_*` keys (see `perf/RAMP.md`): `ramp_start_rate` (required), `ramp_step_rate` (= start), `ramp_max_rate` (none) — cluster totals, ops/s; `ramp_warmup` 30s, `ramp_measure` 60s; `ramp_mode` `sla` (criteria `ramp_max_p99_ms` 50, `ramp_max_missed_pct` 0.1, `ramp_max_error_pct` 0.1, `ramp_min_achieved_pct` 99, `ramp_max_backlog_growth_pct` 50) or `throughput` (only achieved, default 98%, and errors; latency ignored). `ops` is not allowed; `duration` is ignored. Every async run logs the Little's-law bound (in-flight cap / latency) first |
 | `verify_threads` | 4 | threads per worker for list-based Verify scans (§5.4); independent of `threads_per_worker` |
 | `tenant_name` | `kv-poc` (`KVRGW_TENANT_NAME`) | tenant to use |
-| `batch_size`, `batch_timeout_us`, `batch_threads` | from `kvrgw.yaml` | PutObject batch queue; applied by the worker via `service.batch_queue()` (stop/start as `perf_driver.cpp`'s `set-batch` does) only if explicitly set |
+| `batch_size`, `batch_timeout_us` | from `kvrgw.yaml` | PutObject batch queue (`kvrgw:` section; exported as `KVRGW_BATCH_*`) |
+| `backend_workers` | 4 | `kvrgw:` section, `KVRGW_BACKEND_WORKERS`: backend worker executors (replaces `batch_threads`, still accepted as a deprecated alias) |
+| `max_inflight_ops` | 4096 | `kvrgw:`, `KVRGW_MAX_INFLIGHT_OPS`: async op admission limit; beyond it a submit fails with `QUEUE_FULL` (reported as `queue_full`) |
+| `txn_max_attempts`, `batch_txn_max_attempts`, `txn_timeout_ms` | 3, 10, 0 | `kvrgw:`, `KVRGW_TXN_MAX_ATTEMPTS` / `KVRGW_BATCH_TXN_MAX_ATTEMPTS` / `KVRGW_TXN_TIMEOUT_MS` |
 | `report_interval_ms` | 1000 | progress-window length |
 | `fdb_stats` | true | controller samples `fdbcli status json` (§8.2); disable with `--no-fdb-stats` |
 | `fdb_cluster_file` | `$FDB_CLUSTER_FILE` | cluster file passed to `fdbcli -C` |
@@ -391,6 +408,9 @@ A thread with `count == 0` simply does nothing. Op-count splitting for `--ops N`
 uses the same remainder rule over `total_threads`.
 
 ### 5.4 Verification by listing + bitset
+
+("Thread" below means stream: `thread_counts` and `delete_progress` are indexed by
+global stream id.)
 
 Because prefixes are random, a thread's index range is not a contiguous key range
 and cannot be listed directly. Instead verification lists **whole buckets** and
@@ -510,7 +530,7 @@ message PhaseEvent {
 }
 message RunSummary {
   int32 worker_index = 1;
-  repeated uint64 thread_counts = 2; // indexed by thread_id within the worker
+  repeated uint64 thread_counts = 2; // indexed by stream id within the worker
 }
 message ProgressReport {
   int32 worker_index = 1;
@@ -520,6 +540,8 @@ message ProgressReport {
   repeated OpStats cumulative_stats = 5; // full snapshot, not delta
   int64 cumulative_as_of_unix_ns = 6;
   ServerStats server_stats = 7; // cumulative snapshot of in-process kvrgw stats
+  // (8: error_descriptions)
+  double target_rate = 9;      // open loop only: this worker's target ops/s
 }
 // Snapshot of the worker's in-process kvrgw statistics (the same counters the
 // legacy admin socket exposed via get-latency / get-batch-stats / get-error-stats).
@@ -535,7 +557,15 @@ message ServerStats {
   uint64 txn_retries = 7;           // if exposed; else 0
   uint64 txn_hard_failures = 8;     // if exposed; else 0
   map<string, uint64> errors = 9;   // KvrgwErrorCode name -> count, non-zero only
+  uint64 queue_full_rejects = 10;   // async ops refused at the in-flight limit
+  uint64 inflight_ops_peak = 11;    // gauge
+  uint64 frames_heap_fallback = 12; // coroutine frames above the pool's largest class
+  uint64 max_frame_size = 13;       // gauge, bytes
+  repeated ThreadUsage threads = 14;// backend workers, FDB network thread, async drivers
+  double fdb_network_busyness = 15; // libfdb_c's own gauge, 0..1
 }
+// Cumulative CPU and wall time of one thread; utilisation = delta(cpu) / delta(wall).
+message ThreadUsage { string name = 1; string group = 2; uint64 cpu_ns = 3; uint64 wall_ns = 4; }
 message ServerOpStats {
   string op = 1;                    // e.g. "PutObject", "ListObjects"
   uint64 count = 2;
@@ -548,11 +578,16 @@ message ServerOpStats {
 }
 message OpStats {
   string operation_type = 1;   // "put_object","list_objects","delete_multi",
-                               // plus counter-style types: "keys_listed","keys_deleted"
+                               // plus counter-style types: "keys_listed","keys_deleted",
+                               // and "send_lag" (open loop: send time - scheduled time
+                               // per op; a latency histogram, count = ops sent)
   uint64 count = 2;            // successes; latency covers only these
   uint64 errors = 3;
   uint64 sum_micros = 4;
   Histogram latency = 5;       // empty for counter-style types (count = units)
+  // (6: error_codes)
+  uint64 queue_full = 7;       // submits refused with KVRGW_ERR_QUEUE_FULL (backed off, not errors)
+  uint64 missed = 8;           // open loop: ops due but not issued
 }
 message Histogram { repeated uint32 bucket_index = 1; repeated uint64 bucket_count = 2; }
 message VerifyResult {
@@ -621,11 +656,31 @@ read.**
   `list_object_versions(tenant, bucket, prefix, max_keys, key_marker, version_id_marker, &out)`,
   `delete_multi(tenant, bucket, keys, objects, &outcomes)`. Prefer the C++ service
   API (as `perf_driver.cpp` does) over the C API.
-- Threads: `threads_per_worker` `std::jthread`s. Each thread owns a local
-  `ThreadStats` (per-op window + cumulative histograms) to avoid contention; a
-  reporter thread snapshots/merges at each window boundary and calls
-  `ServerWriter::Write` (guard with a mutex). Use a monotonic clock for latency;
-  windows are derived from `run_start_unix_ns`.
+- Streams. `driver_mode: sync`: one `std::thread` per stream (`run_thread`), each
+  with its own `ThreadStats`. `driver_mode: async`: `driver_threads` executors (one
+  thread each); stream `sid` runs `run_stream` (a coroutine) on driver
+  `sid % driver_threads`, and the streams of one driver share that driver's
+  `ThreadStats`. A stream that gets `KVRGW_ERR_QUEUE_FULL` backs off on its executor
+  (100 µs × 2ⁿ, capped at 10 ms) and counts `queue_full`; it is not an attempt. Open
+  loop: each driver issues ops on a timerfd schedule, `t0 + k × driver_threads / rate`,
+  with at most `max_inflight_ops / driver_threads` outstanding (the rest are
+  `missed`), and latency counts from the scheduled time. The same driver also prepares
+  each op and handles its completion, so a busy driver sends late; each op's send time
+  minus scheduled time is recorded as `send_lag`. A reporter snapshots/merges
+  at each window boundary and calls `ServerWriter::Write`. Use a monotonic clock for
+  latency; windows are derived from `run_start_unix_ns`.
+- Ramp (`--ramp`): the controller sends `RunControl.set_rate {step, rate, effective_at}`
+  one step ahead; each generator re-anchors its arrival schedule at `effective_at` (its key
+  counter continues, so verify is unchanged). `ProgressReport.outstanding` reports the
+  open-loop ops in flight at each window end, and `service_time` (send → completion)
+  complements `send_lag`. Step evaluation, criteria and outputs: `perf/RAMP.md`.
+- Thread utilisation: `ServerStats.threads` carries cumulative CPU and wall time per
+  backend worker, FDB network thread and (async mode) driver executor, and
+  `fdb_network_busyness` libfdb_c's own gauge; the report turns them into busy % per
+  thread over the analysed window and tuning hints (§8.3).
+- Latency accounting: the async ops (and their sync wrappers) record their own
+  server-side latency once per call; the worker does not wrap them in
+  `ScopedRequestLatency`.
 - Each op is recorded with its `operation_type`; errors counted per type with the
   `kvrgw_strerror` text logged (rate-limited) to the worker log.
 - `ServerStats` (§6): at each window boundary the reporter also reads the runtime's
@@ -682,9 +737,10 @@ All timestamps are Unix milliseconds UTC (`unix_ts_ms`) from the controller's cl
 | `config.resolved.json` | fully resolved config (§5.1) |
 | `events.csv` | `unix_ts_ms,event` for `invocation_start`, `init_done`, `benchmark_start` (= `run_start_unix_ns`), `benchmark_end` (last worker DONE), `verify_start`, `verify_end`, `invocation_end` |
 | `summary.json` | command, parameters, totals per op, per-worker `RunSummary`, verify result (incl. per-bucket missing counts/keys), error count, exit status |
-| `metrics.csv` | client metrics, one row per (window, op_type): `unix_ts_ms, window, op_type, count, errors, ops_per_sec, mean_us, p50_us, p90_us, p99_us, p999_us, max_us, cum_count, cum_errors`. Counter-style types (`keys_listed`, `keys_deleted`) fill `count`/`ops_per_sec` (= units/s) and leave latency columns empty. `unix_ts_ms` is the window end. Flushed every window |
+| `metrics.csv` | client metrics, one row per (window, op_type): `unix_ts_ms, window, op_type, count, errors, ops_per_sec, mean_us, p50_us, p90_us, p99_us, p999_us, max_us, cum_count, cum_errors, queue_full, missed`. Counter-style types (`keys_listed`, `keys_deleted`) fill `count`/`ops_per_sec` (= units/s) and leave latency columns empty. `send_lag` (open loop) is a latency row whose `count` is ops sent and whose latency columns are send time minus scheduled time. `queue_full` / `missed` (async / open loop) are absent in results from older versions. `unix_ts_ms` is the window end. Flushed every window |
+| `ramp_steps.csv` | `--ramp` only: one row per evaluated step — target, measure seconds, scheduled / completed / errors / missed, achieved ops/s and %, missed %, error %, end-to-end p50 / p99 / p99.9, service-time p99, send-lag p99, outstanding at the start and end of the measure window, backlog growth %, busiest driver %, mean latency, Little's-law max rate at that latency, verdict (`pass`, `fail`, `generator-limited`) and the failed criteria. `summary.json` gains `ramp` (steps, max sustainable, max achieved, stop reason) and `events.csv` a `ramp_step_<i>_<rate>_ops_per_sec` event per step |
 | `hist.csv` | sparse merged per-window histograms: `window, op_type, bucket_index, count` (lets `report` compute overall quantiles over any time range) |
-| `server_stats.csv` | server-side kvrgw stats summed over workers, long format, cumulative (consumers diff): `unix_ts_ms,window,name,value`. `name` is `<Op>.count`, `<Op>.total_us`, `<Op>.fdb_us`, `<Op>.fdb_get_us`, `<Op>.fdb_commit_us`, `<Op>.fdb_scan_us`, `<Op>.disk_us` (e.g. `PutObject.count`), `batch.commits`, `batch.entries`, `batch.wait_us_total`, `batch.queue_size_total`, `batch.conflict_pushbacks`, `txn.retries`, `txn.hard_failures`, or `error.<KvrgwErrorCode name>` |
+| `server_stats.csv` | server-side kvrgw stats summed over workers, long format, cumulative (consumers diff): `unix_ts_ms,window,name,value`. `name` is `<Op>.count`, `<Op>.total_us`, `<Op>.fdb_us`, `<Op>.fdb_get_us`, `<Op>.fdb_commit_us`, `<Op>.fdb_scan_us`, `<Op>.disk_us` (e.g. `PutObject.count`), `batch.commits`, `batch.entries`, `batch.wait_us_total`, `batch.queue_size_total`, `batch.conflict_pushbacks`, `txn.retries`, `txn.hard_failures`, `error.<KvrgwErrorCode name>`, `async.queue_full_rejects`, `async.inflight_ops_peak` (gauge), `async.frames_heap_fallback`, `async.max_frame_size` (gauge), per-thread `thread.<group>.w<worker>.<thread>.cpu_ns` / `.wall_ns` (group `backend`, `fdb-network` or `driver`; per worker, so not summed), or `fdbnet.w<worker>.busyness_ppm` (gauge, libfdb_c network busyness in parts per million) |
 | `cpu.csv` | `unix_ts_ms,source,cores` — `source` = `worker-<i>` (CPU of the worker process, in cores, from `/proc/<pid>/stat` utime+stime delta) or `system` (whole-host CPU busy in cores-equivalent from `/proc/stat` delta) |
 | `fdb_cluster.csv` | `unix_ts_ms, txn_hz, reads_hz, writes_hz, conflict_hz, worst_queue_ss, worst_queue_log, limiting_queue_ss, durability_lag_s` |
 | `fdb_process.csv` | long format, one row per (sample, process, role): `unix_ts_ms, addr, role, cpu_cores, mem_bytes, rss_bytes, input_hz, durable_hz, stored_bytes, kvstore_bytes, data_lag_s, durability_lag_s, queue_disk_bytes, queue_mem_bytes, disk_busy, disk_reads_hz, disk_writes_hz` (fields not applicable to a role are empty) |
@@ -798,7 +854,32 @@ as `keys_listed` print only ops/sec):
  [OK] TLog queue stable (first half 1.0GB, second half 1.1GB)
 ```
 
-(The numbers are illustrative.) Definitions:
+(The numbers are illustrative; the block predates the async additions below.)
+
+Async and open-loop additions:
+- Ramp (`--ramp`): a Ramp section with the step table (target, achieved, p50 / p99,
+  service p99, missed, errors, backlog, driver busy, verdict and failed criteria), the stop
+  reason, the maximum sustainable rate (highest passing target) and the maximum achieved
+  rate.
+- Header: a `Clients` line with workers × streams (× generators in open loop),
+  `driver_mode`, and in async mode `driver_threads` (and `rate_ops_per_sec`).
+- Client run totals: a `queue_full` column for async runs (or whenever non-zero), with a
+  `[WARN]` when submits hit `max_inflight_ops`. In open loop: target vs achieved rate,
+  `missed` (`[WARN]` when non-zero), and the `send_lag` percentiles. When send-lag p99
+  exceeds 1 ms: `[INFO]` (negligible) if it is under 10% of the op's p99; otherwise a
+  `[WARN]` that part of the latency is client-side, suggesting more `driver_threads`
+  when the busiest driver is at least 50% busy and naming send bursts (late timer
+  wake-ups, back-to-back preparation of due ops) when it is not.
+- Server-side KVRGW: `queue_full_rejects` and the highest `inflight_ops_peak`.
+- Thread utilisation: busy % (delta CPU / delta wall over the analysed window) per
+  group — `backend`, `fdb-network`, `driver` — with thread count, average, maximum and
+  the busiest thread (`--detailed`: one row per thread), libfdb_c's network busyness,
+  and tuning hints at 85% busy / 25% idle: a saturated `fdb-network` thread is the
+  per-process ceiling (add worker processes); saturated or unevenly loaded backend
+  workers or drivers (raise `backend_workers` / `driver_threads`); mostly idle ones
+  (could be lowered); otherwise `[OK]`, the limit is elsewhere.
+
+Definitions:
 - **FDB by role** (default, aggregated): per process take the median of each metric
   over the analysis window; print the min–max across the processes of the role.
   `in/dur` = median `input_hz` / median `durable_hz`. With `--per-server`,

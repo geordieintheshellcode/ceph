@@ -8,29 +8,62 @@ class PutObjectOp : public Operation {
  public:
   std::string init(RunContext &ctx) override
   {
-    counts_.assign(static_cast<size_t>(ctx.cfg.threads_per_worker), 0);
+    counts_.assign(static_cast<size_t>(ctx.streams()), 0);
     std::vector<uint64_t> all;
     for (uint64_t b = 0; b < ctx.cfg.num_buckets; ++b) all.push_back(b);
     return check_buckets(ctx, all);
   }
 
-  void run_thread(RunContext &ctx, int tid) override
+  void run_thread(RunContext &ctx, int sid) override
   {
     if (!ctx.wait_start()) return;
-    const uint64_t gtid = static_cast<uint64_t>(ctx.worker_index * ctx.cfg.threads_per_worker + tid);
-    const std::string &bucket = ctx.bucket(gtid % ctx.cfg.num_buckets);
-    ThreadStats &ts = ctx.stats->thread(tid);
-    const uint64_t quota = ctx.cfg.has_ops() ? ctx.ops_quota(gtid) : UINT64_MAX;
+    const uint64_t gsid = ctx.gsid(sid);
+    const std::string &bucket = ctx.bucket(gsid % ctx.cfg.num_buckets);
+    ThreadStats &ts = ctx.stats->thread(sid);
+    const uint64_t quota = ctx.cfg.has_ops() ? ctx.ops_quota(gsid) : UINT64_MAX;
     uint64_t counter = 0;
     while (!ctx.stopped() && counter < quota && !ctx.expired()) {
       if (!put_with_retry(ctx, ts, bucket,
                           put_key(static_cast<uint64_t>(ctx.run_start_unix_s),
-                                  static_cast<uint32_t>(gtid), counter, ctx.cfg.padding_bytes))) {
+                                  static_cast<uint32_t>(gsid), counter, ctx.cfg.padding_bytes))) {
         break;
       }
       ++counter;
-      counts_[static_cast<size_t>(tid)] = counter;
+      counts_[static_cast<size_t>(sid)] = counter;
     }
+  }
+
+  // The run_thread loop with co_await.
+  kvrgw::async::Task<void> run_stream(RunContext &ctx, Stream &s) override
+  {
+    const std::string &bucket = ctx.bucket(s.gsid % ctx.cfg.num_buckets);
+    const uint64_t quota = ctx.cfg.has_ops() ? ctx.ops_quota(s.gsid) : UINT64_MAX;
+    for (uint64_t n = 0; !ctx.stopped() && n < quota && !ctx.expired();) {
+      // Owned by this frame: put_object_a views it until it completes.
+      const std::string key = put_key(static_cast<uint64_t>(ctx.run_start_unix_s),
+                                      static_cast<uint32_t>(s.gsid), n, ctx.cfg.padding_bytes);
+      if (!co_await put_with_retry_a(ctx, s, bucket, key)) break;
+      counts_[static_cast<size_t>(s.sid)] = ++n;
+    }
+  }
+
+  bool supports_open_loop() const override { return true; }
+
+  // Op i puts key i of this generator: the counter advances at issue, and every
+  // put retries until it succeeds or the run fails, so after the drain the keys
+  // are [0, issued) with no gaps.
+  kvrgw::async::Task<void> open_loop_op(RunContext &ctx, Stream &s, uint64_t i,
+                                        SteadyClock::time_point sched) override
+  {
+    const std::string &bucket = ctx.bucket(s.gsid % ctx.cfg.num_buckets);
+    const std::string key = put_key(static_cast<uint64_t>(ctx.run_start_unix_s),
+                                    static_cast<uint32_t>(s.gsid), i, ctx.cfg.padding_bytes);
+    co_await put_with_retry_a(ctx, s, bucket, key, nullptr, &sched);
+  }
+
+  void open_loop_done(RunContext &, Stream &s, uint64_t issued) override
+  {
+    counts_[static_cast<size_t>(s.sid)] = issued;
   }
 
   std::vector<uint64_t> thread_counts() const override { return counts_; }
@@ -38,7 +71,7 @@ class PutObjectOp : public Operation {
   std::string verify(RunContext &ctx, const std::vector<uint64_t> &counts,
                      VerifyReport *out) override
   {
-    if (counts.size() != static_cast<size_t>(ctx.total_threads())) {
+    if (counts.size() != static_cast<size_t>(ctx.total_streams())) {
       return "verify: thread_counts has wrong length";
     }
     Failures f(ctx.verify_keys_checked);
@@ -59,7 +92,7 @@ class PutObjectOp : public Operation {
   }
 
  private:
-  std::vector<uint64_t> counts_;  // each element written by one thread only
+  std::vector<uint64_t> counts_;  // each element written by one stream only
 };
 
 }  // namespace
