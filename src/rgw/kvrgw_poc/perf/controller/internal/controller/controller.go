@@ -79,6 +79,7 @@ type invocation struct {
 	benchEndMs                     int64
 	fdbStart, fdbEnd               *collect.ClusterSample
 	fdbConfig                      []collect.RoleRow
+	ramp                           *rampDriver // --ramp runs only
 }
 
 func (v *invocation) fail(format string, a ...any) {
