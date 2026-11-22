@@ -436,6 +436,23 @@ set_target_properties(multipart_goa_test PROPERTIES
   INSTALL_RPATH "${FDB_LIB_DIR};$ORIGIN"
 )
 
+# delete_multi: an absent key in a later chunk must not reuse an earlier
+# chunk's per-key state. Needs a live FDB cluster.
+add_executable(delete_multi_chunk_test
+  tests/delete_multi_chunk_test.cpp
+)
+target_include_directories(delete_multi_chunk_test PRIVATE
+  "${CMAKE_SOURCE_DIR}/src"
+  "${FDB_INCLUDE_DIR}"
+  ${YAML_CPP_INCLUDE_DIRS}
+)
+target_link_directories(delete_multi_chunk_test PRIVATE "${FDB_LIB_DIR}")
+target_link_libraries(delete_multi_chunk_test PRIVATE kvrgw)
+set_target_properties(delete_multi_chunk_test PROPERTIES
+  BUILD_RPATH "${FDB_LIB_DIR};$ORIGIN"
+  INSTALL_RPATH "${FDB_LIB_DIR};$ORIGIN"
+)
+
 enable_testing()
 add_test(NAME object_value_test COMMAND object_value_test)
 add_test(NAME l_key_test COMMAND l_key_test)
@@ -451,6 +468,7 @@ add_test(NAME err_insertion_test COMMAND err_insertion_test)
 add_test(NAME batch_mixed_test COMMAND batch_mixed_test)
 add_test(NAME d_write_test COMMAND d_write_test)
 add_test(NAME put_condition_test COMMAND put_condition_test)
+add_test(NAME delete_multi_chunk_test COMMAND delete_multi_chunk_test)
 
 # Optional gRPC perf harness (perf/): worker + Go controller. Off by default so the
 # default build does not need gRPC/protobuf.
